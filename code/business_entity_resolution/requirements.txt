@@ -1,0 +1,6 @@
+pandas
+xgboost
+rapidfuzz
+sentence-transformers
+faiss-cpu
+datasketch
