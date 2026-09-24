@@ -6,12 +6,9 @@ from sklearn.model_selection import GroupKFold
 from data_cleaner import process_dataframe
 from blocker import LayeredBlocker
 from feature_engineering import build_features_for_pairs
+from llm_sniper import LLMSniper
 
 def f_05_score(y_true, y_pred):
-    """
-    Computes the F-0.5 score as described in the challenge.
-    F_0.5 = (1.25 * Precision * Recall) / (0.25 * Precision + Recall)
-    """
     tp = sum((y_true == 1) & (y_pred == 1))
     fp = sum((y_true == 0) & (y_pred == 1))
     fn = sum((y_true == 1) & (y_pred == 0))
@@ -24,18 +21,12 @@ def f_05_score(y_true, y_pred):
     return (1.25 * precision * recall) / (0.25 * precision + recall)
 
 def train_xgboost(df_features, labels, groups):
-    """
-    Trains XGBoost using GroupKFold (grouped by Source 1 Entity ID to prevent data leakage).
-    """
     print("\nTraining XGBoost Classifier...")
-    features = [c for c in df_features.columns if c not in ['source1_entity_id', 'candidate_entity_id', 'match_label']]
-    
+    features = [c for c in df_features.columns if c not in ['source1_entity_id', 'candidate_entity_id', 'match_label', 'is_true_match']]
     X = df_features[features]
     y = labels
     
-    # Stratify by S1 ID
     gkf = GroupKFold(n_splits=5)
-    
     models = []
     
     for fold, (train_idx, val_idx) in enumerate(gkf.split(X, y, groups=groups)):
@@ -43,33 +34,18 @@ def train_xgboost(df_features, labels, groups):
         X_train, y_train = X.iloc[train_idx], y.iloc[train_idx]
         X_val, y_val = X.iloc[val_idx], y.iloc[val_idx]
         
-        clf = xgb.XGBClassifier(
-            n_estimators=500,
-            learning_rate=0.05,
-            max_depth=6,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            random_state=42,
-            eval_metric='logloss',
-            early_stopping_rounds=50
-        )
-        
+        clf = xgb.XGBClassifier(n_estimators=500, learning_rate=0.05, max_depth=6, early_stopping_rounds=50, random_state=42)
         clf.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=50)
         models.append(clf)
         
-        # Test F-0.5 on validation
         preds_proba = clf.predict_proba(X_val)[:, 1]
-        
-        # Tune threshold for F-0.5
-        best_thresh = 0.5
-        best_score = 0
+        best_thresh, best_score = 0.5, 0
         for thresh in [0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85]:
             preds = (preds_proba > thresh).astype(int)
             score = f_05_score(y_val, preds)
             if score > best_score:
                 best_score = score
                 best_thresh = thresh
-                
         print(f"Fold {fold+1} Best F-0.5 Score: {best_score:.4f} at Threshold: {best_thresh}")
         
     return models
@@ -84,20 +60,12 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     nrows = 1000 if args.test_mode else None
 
-    # 1. LOAD DATA
-    df_s1 = pd.read_csv(os.path.join(args.data_dir, "train_source1.tsv"), sep="\t", nrows=nrows)
-    df_s2 = pd.read_csv(os.path.join(args.data_dir, "train_source2.tsv"), sep="\t", nrows=nrows)
-    df_s3 = pd.read_csv(os.path.join(args.data_dir, "train_source3.tsv"), sep="\t", nrows=nrows)
-    
+    df_s1 = process_dataframe(pd.read_csv(os.path.join(args.data_dir, "train_source1.tsv"), sep="\t", nrows=nrows))
+    df_s2 = process_dataframe(pd.read_csv(os.path.join(args.data_dir, "train_source2.tsv"), sep="\t", nrows=nrows))
+    df_s3 = process_dataframe(pd.read_csv(os.path.join(args.data_dir, "train_source3.tsv"), sep="\t", nrows=nrows))
+    df_pool = pd.concat([df_s2, df_s3])
     gt = pd.read_csv(os.path.join(args.data_dir, "train_ground_truth.tsv"), sep="\t")
 
-    # 2. CLEAN DATA
-    df_s1 = process_dataframe(df_s1)
-    df_s2 = process_dataframe(df_s2)
-    df_s3 = process_dataframe(df_s3)
-    df_pool = pd.concat([df_s2, df_s3])
-
-    # 3. RUN BLOCKING
     blocker = LayeredBlocker()
     blocker.layer1_exact_key_blocking(df_s1, df_s2, df_s3)
     blocker.layer2_minhash_lsh(df_s1, df_s2, df_s3)
@@ -106,29 +74,15 @@ def main():
     
     df_pairs = blocker.export_candidate_pairs(os.path.join(args.output_dir, "candidate_pairs.tsv"))
 
-    # 4. GENERATE GROUND TRUTH LABELS FOR XGBOOST
-    print("\nMapping Ground Truth labels to candidates...")
-    # Expand ground truth comma separated list into multiple rows
     gt_exploded = gt.assign(matched_entity_ids=gt['matched_entity_ids'].str.split(',')).explode('matched_entity_ids')
     gt_exploded['is_true_match'] = 1
-    
-    # Merge to label candidates (1 if true match, 0 if false positive from blocking)
-    df_pairs = df_pairs.merge(
-        gt_exploded, 
-        left_on=['source1_entity_id', 'candidate_entity_id'], 
-        right_on=['source1_entity_id', 'matched_entity_ids'], 
-        how='left'
-    )
+    df_pairs = df_pairs.merge(gt_exploded, left_on=['source1_entity_id', 'candidate_entity_id'], right_on=['source1_entity_id', 'matched_entity_ids'], how='left')
     df_pairs['is_true_match'] = df_pairs['is_true_match'].fillna(0)
 
-    # 5. FEATURE ENGINEERING
     df_features = build_features_for_pairs(df_pairs, df_s1, df_pool)
-    
-    # 6. TRAIN XGBOOST
-    groups = df_features['source1_entity_id']
-    models = train_xgboost(df_features, df_features['is_true_match'], groups)
+    models = train_xgboost(df_features, df_features['is_true_match'], df_features['source1_entity_id'])
 
-    print("\nPIPELINE COMPLETE. Ready for Inference on Test Set!")
+    print("\nPIPELINE COMPLETE.")
 
 if __name__ == "__main__":
     main()
