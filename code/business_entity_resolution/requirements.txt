@@ -2,7 +2,7 @@ pandas
 xgboost
 rapidfuzz
 sentence-transformers
-faiss-cpu
+faiss-gpu
 datasketch
 transformers
 accelerate

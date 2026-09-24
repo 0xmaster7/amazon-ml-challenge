@@ -34,7 +34,7 @@ def train_xgboost(df_features, labels, groups):
         X_train, y_train = X.iloc[train_idx], y.iloc[train_idx]
         X_val, y_val = X.iloc[val_idx], y.iloc[val_idx]
         
-        clf = xgb.XGBClassifier(n_estimators=500, learning_rate=0.05, max_depth=6, early_stopping_rounds=50, random_state=42)
+        clf = xgb.XGBClassifier(n_estimators=500, learning_rate=0.05, max_depth=6, early_stopping_rounds=50, random_state=42, tree_method="hist", device="cuda")
         clf.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=50)
         models.append(clf)
         
