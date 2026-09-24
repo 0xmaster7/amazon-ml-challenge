@@ -4,3 +4,6 @@ rapidfuzz
 sentence-transformers
 faiss-cpu
 datasketch
+transformers
+accelerate
+bitsandbytes

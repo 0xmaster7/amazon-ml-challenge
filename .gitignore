@@ -3,3 +3,4 @@ amazon_ml/
 __pycache__/
 *.pyc
 .DS_Store
+dataset/
