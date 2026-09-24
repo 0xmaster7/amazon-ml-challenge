@@ -11,26 +11,85 @@ from feature_engineering import build_features_for_pairs
 from llm_sniper import LLMSniper
 
 # ============================================================
-# F-0.5 SCORE (Competition Metric)
+# F-0.5 SCORER — PER-ENTITY MACRO AVERAGE (Competition Formula)
 # ============================================================
-def f_05_score(y_true, y_pred):
-    y_true, y_pred = np.array(y_true), np.array(y_pred)
-    tp = np.sum((y_true == 1) & (y_pred == 1))
-    fp = np.sum((y_true == 0) & (y_pred == 1))
-    fn = np.sum((y_true == 1) & (y_pred == 0))
-    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
-    recall = tp / (tp + fn) if (tp + fn) > 0 else 0
-    if precision + recall == 0:
-        return 0.0
-    return (1.25 * precision * recall) / (0.25 * precision + recall)
+def f_05_per_entity(y_true_dict, y_pred_dict):
+    """
+    Computes the competition's exact F-0.5 macro-average.
+    
+    Args:
+        y_true_dict: dict mapping source1_entity_id -> set of true matched_entity_ids (empty set for singletons)
+        y_pred_dict: dict mapping source1_entity_id -> set of predicted matched_entity_ids (empty set for singletons)
+    
+    Returns:
+        Macro-averaged F-0.5 score across all S1 entities.
+    """
+    scores = []
+    for s1_id in y_true_dict:
+        true_set = y_true_dict[s1_id]
+        pred_set = y_pred_dict.get(s1_id, set())
+        
+        if len(true_set) == 0 and len(pred_set) == 0:
+            # Singleton correctly predicted as empty -> 1.0
+            scores.append(1.0)
+        elif len(true_set) == 0 and len(pred_set) > 0:
+            # Singleton with false predictions -> 0.0
+            scores.append(0.0)
+        elif len(true_set) > 0 and len(pred_set) == 0:
+            # Has matches but predicted empty -> precision is undefined (0/0)
+            # Recall = 0, so F-0.5 = 0.0
+            scores.append(0.0)
+        else:
+            tp = len(true_set & pred_set)
+            fp = len(pred_set - true_set)
+            fn = len(true_set - pred_set)
+            
+            precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+            recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+            
+            if precision + recall == 0:
+                scores.append(0.0)
+            else:
+                f05 = (1.25 * precision * recall) / (0.25 * precision + recall)
+                scores.append(f05)
+    
+    return np.mean(scores) if scores else 0.0
+
+
+def build_entity_dicts(df_features, preds, s1_ids_all, gt):
+    """
+    Converts row-level predictions into per-entity sets for the macro scorer.
+    """
+    # Build true dict from ground truth
+    y_true_dict = {}
+    for _, row in gt.iterrows():
+        s1_id = row['source1_entity_id']
+        matched = row.get('matched_entity_ids', '')
+        if pd.isna(matched) or matched == '':
+            y_true_dict[s1_id] = set()
+        else:
+            y_true_dict[s1_id] = set(str(matched).split(','))
+    
+    # Build pred dict from predictions
+    y_pred_dict = {s1_id: set() for s1_id in y_true_dict}
+    for idx, pred in enumerate(preds):
+        if pred == 1:
+            s1_id = df_features.iloc[idx]['source1_entity_id']
+            cand_id = df_features.iloc[idx]['candidate_entity_id']
+            if s1_id in y_pred_dict:
+                y_pred_dict[s1_id].add(cand_id)
+    
+    return y_true_dict, y_pred_dict
+
 
 # ============================================================
-# XGBOOST TRAINING WITH PROPER VALIDATION
+# XGBOOST TRAINING WITH CORRECT MACRO F-0.5 VALIDATION
 # ============================================================
-def train_xgboost(df_features, labels, groups, output_dir):
+def train_xgboost(df_features, labels, groups, output_dir, gt):
     print("\n========== TRAINING XGBOOST ==========")
     exclude = ['source1_entity_id', 'candidate_entity_id', 'is_true_match', 'match_label']
-    feature_cols = [c for c in df_features.columns if c not in exclude and df_features[c].dtype in ['int64', 'float64', 'int32', 'float32']]
+    feature_cols = [c for c in df_features.columns if c not in exclude 
+                    and df_features[c].dtype in ['int64', 'float64', 'int32', 'float32', 'bool']]
     
     print(f"Using {len(feature_cols)} features: {feature_cols}")
     X = df_features[feature_cols]
@@ -40,6 +99,7 @@ def train_xgboost(df_features, labels, groups, output_dir):
     models = []
     best_global_thresh = 0.5
     best_global_score = 0
+    all_fold_scores = []
     
     for fold, (train_idx, val_idx) in enumerate(gkf.split(X, y, groups=groups)):
         print(f"\n--- Fold {fold+1}/5 ---")
@@ -58,31 +118,65 @@ def train_xgboost(df_features, labels, groups, output_dir):
         
         preds_proba = clf.predict_proba(X_val)[:, 1]
         
+        # Get the val subset of df_features for per-entity scoring
+        df_val = df_features.iloc[val_idx].copy()
+        
         # Fine-grained threshold sweep: 0.30 to 0.90 in steps of 0.02
+        # Now using the CORRECT per-entity macro F-0.5
         best_thresh, best_score = 0.5, 0
         for thresh_int in range(30, 91, 2):
             thresh = thresh_int / 100.0
             preds = (preds_proba > thresh).astype(int)
-            score = f_05_score(y_val, preds)
+            
+            # Build per-entity dicts for this fold's validation set
+            val_s1_ids = df_val['source1_entity_id'].unique()
+            y_true_dict = {}
+            y_pred_dict = {}
+            for s1_id in val_s1_ids:
+                # Get true matches from ground truth
+                gt_row = gt[gt['source1_entity_id'] == s1_id]
+                if len(gt_row) > 0:
+                    matched = gt_row.iloc[0].get('matched_entity_ids', '')
+                    if pd.isna(matched) or matched == '':
+                        y_true_dict[s1_id] = set()
+                    else:
+                        y_true_dict[s1_id] = set(str(matched).split(','))
+                else:
+                    y_true_dict[s1_id] = set()
+                y_pred_dict[s1_id] = set()
+            
+            # Fill predictions
+            for i, (idx, row) in enumerate(df_val.iterrows()):
+                if preds[i] == 1:
+                    s1_id = row['source1_entity_id']
+                    cand_id = row['candidate_entity_id']
+                    if s1_id in y_pred_dict:
+                        y_pred_dict[s1_id].add(cand_id)
+            
+            score = f_05_per_entity(y_true_dict, y_pred_dict)
             if score > best_score:
                 best_score = score
                 best_thresh = thresh
         
-        print(f"Fold {fold+1} Best F-0.5: {best_score:.4f} at threshold: {best_thresh}")
+        print(f"Fold {fold+1} Best MACRO F-0.5: {best_score:.4f} at threshold: {best_thresh}")
+        all_fold_scores.append(best_score)
         
         if best_score > best_global_score:
             best_global_score = best_score
             best_global_thresh = best_thresh
     
-    print(f"\n>>> Best overall F-0.5: {best_global_score:.4f} at threshold: {best_global_thresh}")
+    avg_score = np.mean(all_fold_scores)
+    print(f"\n>>> Average MACRO F-0.5 across folds: {avg_score:.4f}")
+    print(f">>> Best single-fold MACRO F-0.5: {best_global_score:.4f} at threshold: {best_global_thresh}")
     
-    # Save best model and threshold
+    # Save models, threshold, and feature list
     model_path = os.path.join(output_dir, "xgb_model.pkl")
     with open(model_path, 'wb') as f:
         pickle.dump({'models': models, 'threshold': best_global_thresh, 'features': feature_cols}, f)
     print(f"Models saved to {model_path}")
     
     return models, best_global_thresh, feature_cols
+
 
 # ============================================================
 # MAIN PIPELINE
@@ -158,13 +252,13 @@ def main():
 
     # =================== TRAIN XGBOOST ===================
     models, best_thresh, feature_cols = train_xgboost(
-        df_features, df_features['is_true_match'], df_features['source1_entity_id'], args.output_dir
+        df_features, df_features['is_true_match'], df_features['source1_entity_id'], 
+        args.output_dir, gt
     )
 
     # =================== LLM SNIPER ON BORDERLINE PAIRS ===================
     if not args.skip_llm:
         print("\n========== LLM SNIPER (Borderline Arbitration) ==========")
-        # Use best model (last fold) for scoring
         X_all = df_features[feature_cols]
         all_proba = models[-1].predict_proba(X_all)[:, 1]
         df_features['xgb_prob'] = all_proba
@@ -173,9 +267,8 @@ def main():
         n_borderline = borderline_mask.sum()
         print(f"Borderline pairs (0.35-0.65): {n_borderline}")
         
-        if n_borderline > 0 and n_borderline < 5000:  # Don't send too many to LLM
+        if n_borderline > 0 and n_borderline < 5000:
             try:
-                # Re-merge text columns for LLM prompting
                 df_border = df_features[borderline_mask].copy()
                 df_border = df_border.merge(df_s1[['entity_id', 'clean_name', 'clean_address']],
                                             left_on='source1_entity_id', right_on='entity_id', how='left')
@@ -191,9 +284,9 @@ def main():
             except Exception as e:
                 print(f"LLM Sniper failed: {e}. Using XGBoost threshold only.")
         else:
-            print(f"Skipping LLM (too many borderline pairs: {n_borderline})")
+            print(f"Skipping LLM (borderline pairs: {n_borderline})")
 
-    print("\n========== PIPELINE COMPLETE ==========")
+    print("\n========== TRAINING PIPELINE COMPLETE ==========")
 
 if __name__ == "__main__":
     main()
