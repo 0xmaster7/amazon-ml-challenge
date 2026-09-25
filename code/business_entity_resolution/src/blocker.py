@@ -84,10 +84,14 @@ class LayeredBlocker:
         
         # Dimensions for paraphrase-multilingual-MiniLM-L12-v2 is 384
         d = 384 
-        import os, gc
+        import os, gc, torch
         
+        # Store in /kaggle/working so rm -rf amazon-ml-challenge will NEVER delete the embeddings
+        mmap_dir = "/kaggle/working" if os.path.exists("/kaggle/working") else "."
+        pool_mmap_path = os.path.join(mmap_dir, "pool_embeddings.dat")
+        s1_mmap_path = os.path.join(mmap_dir, "s1_embeddings.dat")
+
         # Check if pool embeddings already exist on disk from previous run
-        pool_mmap_path = "pool_embeddings.dat"
         expected_pool_bytes = len(pool_texts) * d * 4
         if os.path.exists(pool_mmap_path) and os.path.getsize(pool_mmap_path) == expected_pool_bytes:
             print(f"Found existing {pool_mmap_path} ({os.path.getsize(pool_mmap_path) / 1e9:.2f} GB). Skipping pool encoding!")
@@ -100,7 +104,7 @@ class LayeredBlocker:
             for i in range(0, len(pool_texts), chunk_size):
                 chunk = pool_texts[i:i+chunk_size]
                 print(f"  Encoding pool chunk {i} to {i+len(chunk)}...")
-                emb_chunk = model.encode(chunk, show_progress_bar=True, normalize_embeddings=True, batch_size=256)
+                emb_chunk = model.encode(chunk, show_progress_bar=True, normalize_embeddings=True, batch_size=1024)
                 pool_embeddings[i:i+len(chunk)] = emb_chunk
                 pool_embeddings.flush()
                 del emb_chunk, chunk
@@ -109,7 +113,6 @@ class LayeredBlocker:
             gc.collect()
 
         # Check if S1 embeddings already exist on disk from previous run
-        s1_mmap_path = "s1_embeddings.dat"
         expected_s1_bytes = len(s1_texts) * d * 4
         if os.path.exists(s1_mmap_path) and os.path.getsize(s1_mmap_path) == expected_s1_bytes:
             print(f"Found existing {s1_mmap_path} ({os.path.getsize(s1_mmap_path) / 1e9:.2f} GB). Skipping S1 encoding!")
@@ -122,7 +125,7 @@ class LayeredBlocker:
             for i in range(0, len(s1_texts), chunk_size):
                 chunk = s1_texts[i:i+chunk_size]
                 print(f"  Encoding S1 chunk {i} to {i+len(chunk)}...")
-                emb_chunk = model.encode(chunk, show_progress_bar=True, normalize_embeddings=True, batch_size=256)
+                emb_chunk = model.encode(chunk, show_progress_bar=True, normalize_embeddings=True, batch_size=1024)
                 s1_embeddings[i:i+len(chunk)] = emb_chunk
                 s1_embeddings.flush()
                 del emb_chunk, chunk
