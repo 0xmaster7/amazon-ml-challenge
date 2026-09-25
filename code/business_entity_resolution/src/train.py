@@ -220,7 +220,7 @@ def main():
     print("\n========== STAGE 1: LAYERED BLOCKING ==========")
     blocker = LayeredBlocker()
     blocker.layer1_exact_key_blocking(df_s1, df_s2, df_s3)
-    blocker.layer2_minhash_lsh(df_s1, df_s2, df_s3)
+    # blocker.layer2_minhash_lsh(df_s1, df_s2, df_s3)
     blocker.layer3_semantic_embeddings(df_s1, df_s2, df_s3)
     blocker.layer4_address_only(df_s1, df_s2, df_s3)
 
