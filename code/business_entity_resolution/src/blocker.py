@@ -156,35 +156,77 @@ class LayeredBlocker:
         self.pool_id_to_idx = {pid: i for i, pid in enumerate(self.pool_ids)}
         self.s1_id_to_idx = {sid: i for i, sid in enumerate(self.s1_ids)}
 
-        # Search FAISS in slices of 2.5M vectors (~3.8 GB each) so RAM NEVER spikes
-        print("Searching FAISS in memory-safe slices...")
-        pool_slice_size = 2500000
-        s1_search_batch = 100000
+        # Search embeddings with GPU Tensor Cores if available, else FAISS CPU
+        top_k = 20
+        sim_threshold = 0.55
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print(f"Searching embeddings with accelerator: {device}...")
 
-        for p_start in range(0, n_pool, pool_slice_size):
-            p_end = min(p_start + pool_slice_size, n_pool)
-            print(f"  Indexing pool slice [{p_start}:{p_end}] ({p_end - p_start} vectors)...")
-            sub_index = faiss.IndexFlatIP(d)
-            sub_index.add(np.array(self.pool_embeddings[p_start:p_end]).astype('float32'))
-            
-            print(f"  Searching S1 against pool slice [{p_start}:{p_end}]...")
-            for s_start in range(0, n_s1, s1_search_batch):
-                s_end = min(s_start + s1_search_batch, n_s1)
-                q_chunk = np.array(self.s1_embeddings[s_start:s_end]).astype('float32')
-                # k=20 provides ~3x safety margin over max ground-truth fanout of 7
-                D_chunk, I_chunk = sub_index.search(q_chunk, k=20)
+        if device.type == 'cuda':
+            # Ultra-fast GPU Tensor Core search: ~3-4 minutes for 2.2M x 10.3M!
+            pool_slice_size = 1000000  # 1M vectors per slice (~768 MB in float16)
+            s1_batch_size = 2500       # 2500 queries per batch (~5 GB peak VRAM during matmul)
+            n_pool_slices = (n_pool + pool_slice_size - 1) // pool_slice_size
+
+            for p_idx in range(n_pool_slices):
+                p_start = p_idx * pool_slice_size
+                p_end = min(p_start + pool_slice_size, n_pool)
+                slice_len = p_end - p_start
+                print(f"  GPU Search: Pool slice {p_idx+1}/{n_pool_slices} [{p_start}:{p_end}] ({slice_len} vectors)...")
                 
-                for idx, s1_id in enumerate(self.s1_ids[s_start:s_end]):
-                    for j in range(20):
-                        score = float(D_chunk[idx][j])
-                        match_idx = I_chunk[idx][j]
-                        if match_idx >= 0 and score > 0.55:
-                            cand_id = self.pool_ids[p_start + match_idx]
-                            self._add_pair(s1_id, cand_id, 'layer3_faiss', faiss_rank=j, faiss_score=score)
-                del q_chunk, D_chunk, I_chunk
-            
-            del sub_index
-            gc.collect()
+                pool_tensor = torch.from_numpy(self.pool_embeddings[p_start:p_end]).to(device=device, dtype=torch.float16)
+
+                n_batches = (n_s1 + s1_batch_size - 1) // s1_batch_size
+                for b_idx in range(n_batches):
+                    s_start = b_idx * s1_batch_size
+                    s_end = min(s_start + s1_batch_size, n_s1)
+                    
+                    q_tensor = torch.from_numpy(self.s1_embeddings[s_start:s_end]).to(device=device, dtype=torch.float16)
+                    sim_matrix = torch.matmul(q_tensor, pool_tensor.T)
+                    
+                    actual_k = min(top_k, slice_len)
+                    scores, indices = torch.topk(sim_matrix, k=actual_k, dim=1)
+                    
+                    scores_np = scores.cpu().numpy()
+                    indices_np = indices.cpu().numpy()
+                    
+                    s1_batch_ids = self.s1_ids[s_start:s_end]
+                    for q_i, s1_id in enumerate(s1_batch_ids):
+                        for rank in range(actual_k):
+                            score = float(scores_np[q_i, rank])
+                            if score > sim_threshold:
+                                match_idx = int(indices_np[q_i, rank])
+                                cand_id = self.pool_ids[p_start + match_idx]
+                                self._add_pair(s1_id, cand_id, 'layer3_faiss', faiss_rank=rank, faiss_score=score)
+                                
+                    del q_tensor, sim_matrix, scores, indices
+                    
+                del pool_tensor
+                torch.cuda.empty_cache()
+                print(f"    Slice {p_idx+1}/{n_pool_slices} complete. Total candidate pairs: {len(self.candidate_pairs)}")
+        else:
+            # CPU Fallback using FAISS
+            print("  Falling back to FAISS CPU...")
+            pool_slice_size = 2500000
+            s1_search_batch = 50000
+            for p_start in range(0, n_pool, pool_slice_size):
+                p_end = min(p_start + pool_slice_size, n_pool)
+                sub_index = faiss.IndexFlatIP(d)
+                sub_index.add(np.array(self.pool_embeddings[p_start:p_end]).astype('float32'))
+                for s_start in range(0, n_s1, s1_search_batch):
+                    s_end = min(s_start + s1_search_batch, n_s1)
+                    q_chunk = np.array(self.s1_embeddings[s_start:s_end]).astype('float32')
+                    D_chunk, I_chunk = sub_index.search(q_chunk, k=top_k)
+                    for idx, s1_id in enumerate(self.s1_ids[s_start:s_end]):
+                        for j in range(top_k):
+                            score = float(D_chunk[idx][j])
+                            match_idx = I_chunk[idx][j]
+                            if match_idx >= 0 and score > sim_threshold:
+                                cand_id = self.pool_ids[p_start + match_idx]
+                                self._add_pair(s1_id, cand_id, 'layer3_faiss', faiss_rank=j, faiss_score=score)
+                    del q_chunk, D_chunk, I_chunk
+                del sub_index
+                gc.collect()
 
         print(f"Layer 3 complete. Total pairs so far: {len(self.candidate_pairs)}")
 
