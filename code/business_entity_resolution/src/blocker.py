@@ -70,10 +70,19 @@ class LayeredBlocker:
                     self._add_pair(row['entity_id'], cand_id, 'layer2_minhash')
         print(f"Layer 2 complete. Total pairs so far: {len(self.candidate_pairs)}")
 
-    def layer3_semantic_embeddings(self, df_s1, df_s2, df_s3):
-        print("Running Layer 3: FAISS Semantic Embeddings (paraphrase-multilingual)...")
+    def layer3_semantic_embeddings(self, df_s1, df_s2, df_s3, model_name=None):
+        import os, gc, torch
+        if model_name is None:
+            if os.path.exists("../../output/finetuned_embedder"):
+                model_name = "../../output/finetuned_embedder"
+                print(f"Using fine-tuned embedder: {model_name}")
+            else:
+                model_name = 'sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2'
+
+        print(f"Running Layer 3: FAISS Semantic Embeddings ({model_name})...")
         try:
-            model = SentenceTransformer('sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            model = SentenceTransformer(model_name, device=device)
         except Exception as e:
             print(f"Skipping Layer 3: {e}")
             return
@@ -83,8 +92,7 @@ class LayeredBlocker:
         s1_texts = (df_s1['clean_name'] + " " + df_s1['clean_address']).tolist()
         
         # Dimensions for paraphrase-multilingual-MiniLM-L12-v2 is 384
-        d = 384 
-        import os, gc, torch
+        d = 384
         
         # Store in /kaggle/working so rm -rf amazon-ml-challenge will NEVER delete the embeddings
         mmap_dir = "/kaggle/working" if os.path.exists("/kaggle/working") else "."
@@ -163,13 +171,14 @@ class LayeredBlocker:
             for s_start in range(0, n_s1, s1_search_batch):
                 s_end = min(s_start + s1_search_batch, n_s1)
                 q_chunk = np.array(self.s1_embeddings[s_start:s_end]).astype('float32')
-                D_chunk, I_chunk = sub_index.search(q_chunk, k=50)
+                # k=20 provides ~3x safety margin over max ground-truth fanout of 7
+                D_chunk, I_chunk = sub_index.search(q_chunk, k=20)
                 
                 for idx, s1_id in enumerate(self.s1_ids[s_start:s_end]):
-                    for j in range(50):
+                    for j in range(20):
                         score = float(D_chunk[idx][j])
                         match_idx = I_chunk[idx][j]
-                        if match_idx >= 0 and score > 0.5:
+                        if match_idx >= 0 and score > 0.55:
                             cand_id = self.pool_ids[p_start + match_idx]
                             self._add_pair(s1_id, cand_id, 'layer3_faiss', faiss_rank=j, faiss_score=score)
                 del q_chunk, D_chunk, I_chunk

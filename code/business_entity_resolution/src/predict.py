@@ -32,8 +32,11 @@ def main():
         saved = pickle.load(f)
     models = saved['models']
     threshold = saved['threshold']
+    country_thresholds = saved.get('country_thresholds', {})
     feature_cols = saved['features']
-    print(f"Loaded {len(models)} models. Threshold: {threshold}")
+    print(f"Loaded {len(models)} models. Global Threshold: {threshold}")
+    if country_thresholds:
+        print(f"Country Stratified Thresholds: {country_thresholds}")
     print(f"Features: {feature_cols}")
 
     # =================== LOAD & CLEAN TEST DATA ===================
@@ -79,14 +82,30 @@ def main():
     
     df_features['xgb_prob'] = all_proba
     
-    # =================== LLM SNIPER ===================
-    df_features['final_pred'] = (all_proba > threshold).astype(int)
+    # =================== STRATIFIED THRESHOLDING ===================
+    final_preds = np.zeros(len(df_features), dtype=int)
+    if 'country_s1' in df_features.columns and country_thresholds:
+        print("Applying country-stratified thresholds...")
+        for country, c_thresh in country_thresholds.items():
+            c_mask = df_features['country_s1'].str.lower() == country
+            final_preds[c_mask] = (all_proba[c_mask] > c_thresh).astype(int)
+            print(f"  {country.upper()}: threshold {c_thresh} -> {final_preds[c_mask].sum()} matches")
+        
+        # Other / unseen countries (e.g. France in test set) use global optimal threshold
+        other_mask = ~df_features['country_s1'].str.lower().isin(country_thresholds.keys())
+        if other_mask.any():
+            final_preds[other_mask] = (all_proba[other_mask] > threshold).astype(int)
+            print(f"  OTHER / FRANCE: global threshold {threshold} -> {final_preds[other_mask].sum()} matches")
+    else:
+        final_preds = (all_proba > threshold).astype(int)
+    
+    df_features['final_pred'] = final_preds
     
     if not args.skip_llm:
         print("\n========== LLM SNIPER (Borderline Arbitration) ==========")
-        borderline_mask = (all_proba >= 0.35) & (all_proba <= 0.65)
+        borderline_mask = (all_proba >= threshold - 0.15) & (all_proba <= threshold + 0.15)
         n_borderline = borderline_mask.sum()
-        print(f"Borderline pairs (0.35-0.65): {n_borderline}")
+        print(f"Borderline pairs: {n_borderline}")
         
         if n_borderline > 0 and n_borderline < 5000:
             try:
@@ -104,6 +123,23 @@ def main():
                 print(f"LLM decided {sum(1 for d in llm_decisions if d == 1)} borderline pairs are MATCH.")
             except Exception as e:
                 print(f"LLM Sniper failed: {e}. Using XGBoost threshold only.")
+
+    # =================== POST-PROCESSING: CONFLICT RESOLUTION ===================
+    print("\n========== POST-PROCESSING: CONFLICT RESOLUTION ==========")
+    matched_idx = df_features[df_features['final_pred'] == 1].index
+    if len(matched_idx) > 0:
+        matches_df = df_features.loc[matched_idx].copy()
+        matches_df = matches_df.sort_values(by='xgb_prob', ascending=False)
+        
+        initial_matches = len(matches_df)
+        resolved_matches_df = matches_df.drop_duplicates(subset=['candidate_entity_id'], keep='first')
+        resolved_count = initial_matches - len(resolved_matches_df)
+        
+        demoted_idx = matches_df.index.difference(resolved_matches_df.index)
+        df_features.loc[demoted_idx, 'final_pred'] = 0
+        print(f"Resolved conflicts: demoted {resolved_count} lower-probability matches.")
+    else:
+        print("Resolved conflicts: demoted 0 lower-probability matches.")
 
     # =================== BUILD matching_results.tsv ===================
     print("\n========== BUILDING matching_results.tsv ==========")
@@ -137,8 +173,14 @@ def main():
     # The competition wants: source1_entity_id \t candidate_entity_ids
     # One row per S1 entity, even if empty
     print("\n========== REBUILDING candidate_pairs.tsv (Competition Format) ==========")
-    if len(df_pairs) > 0:
-        cand_grouped = df_pairs.groupby('source1_entity_id')['candidate_entity_id'].apply(
+    initial_cands = len(df_features)
+    # Filter candidate set (XGBoost prob > 0.1 or predicted match)
+    df_filtered_cands = df_features[(df_features['xgb_prob'] > 0.1) | (df_features['final_pred'] == 1)]
+    filtered_cands = len(df_filtered_cands)
+    print(f"Candidate pairs filtered: {initial_cands} -> {filtered_cands} pairs (xgb_prob > 0.1 or final_pred==1)")
+
+    if len(df_filtered_cands) > 0:
+        cand_grouped = df_filtered_cands.groupby('source1_entity_id')['candidate_entity_id'].apply(
             lambda x: ','.join(sorted(set(x)))
         ).reset_index()
         cand_grouped.rename(columns={'candidate_entity_id': 'candidate_entity_ids'}, inplace=True)

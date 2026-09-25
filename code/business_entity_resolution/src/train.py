@@ -4,6 +4,10 @@ import os
 import argparse
 import pickle
 import xgboost as xgb
+try:
+    import lightgbm as lgb
+except ImportError:
+    pass
 from sklearn.model_selection import GroupKFold
 from data_cleaner import process_dataframe
 from blocker import LayeredBlocker
@@ -86,8 +90,8 @@ def build_entity_dicts(df_features, preds, s1_ids_all, gt):
 # XGBOOST TRAINING WITH CORRECT MACRO F-0.5 VALIDATION
 # ============================================================
 def train_xgboost(df_features, labels, groups, output_dir, gt):
-    print("\n========== TRAINING XGBOOST ==========")
-    exclude = ['source1_entity_id', 'candidate_entity_id', 'is_true_match', 'match_label']
+    print("\n========== TRAINING ENSEMBLE (Multiple Seeds) ==========")
+    exclude = ['source1_entity_id', 'candidate_entity_id', 'is_true_match', 'match_label', 'country_s1']
     feature_cols = [c for c in df_features.columns if c not in exclude 
                     and df_features[c].dtype in ['int64', 'float64', 'int32', 'float32', 'bool']]
     
@@ -101,39 +105,41 @@ def train_xgboost(df_features, labels, groups, output_dir, gt):
     best_global_score = 0
     all_fold_scores = []
     
+    oof_preds = np.zeros(len(X))
+    
     for fold, (train_idx, val_idx) in enumerate(gkf.split(X, y, groups=groups)):
         print(f"\n--- Fold {fold+1}/5 ---")
         X_train, y_train = X.iloc[train_idx], y.iloc[train_idx]
         X_val, y_val = X.iloc[val_idx], y.iloc[val_idx]
         
-        clf = xgb.XGBClassifier(
-            n_estimators=1000, learning_rate=0.05, max_depth=7,
-            subsample=0.8, colsample_bytree=0.8,
-            early_stopping_rounds=50, random_state=42,
-            tree_method="hist", device="cuda",
-            scale_pos_weight=len(y_train[y_train==0]) / max(len(y_train[y_train==1]), 1)
-        )
-        clf.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=100)
-        models.append(clf)
-        
-        preds_proba = clf.predict_proba(X_val)[:, 1]
+        preds_proba = np.zeros(len(X_val))
+        for seed in [42, 123, 456]:
+            clf = xgb.XGBClassifier(
+                n_estimators=1000, learning_rate=0.05, max_depth=7,
+                subsample=0.8, colsample_bytree=0.8,
+                early_stopping_rounds=50, random_state=seed,
+                tree_method="hist", device="cuda",
+                scale_pos_weight=len(y_train[y_train==0]) / max(len(y_train[y_train==1]), 1)
+            )
+            clf.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
+            models.append(clf)
+            preds_proba += clf.predict_proba(X_val)[:, 1]
+            
+        preds_proba /= 3.0
+        oof_preds[val_idx] = preds_proba
         
         # Get the val subset of df_features for per-entity scoring
         df_val = df_features.iloc[val_idx].copy()
         
-        # Fine-grained threshold sweep: 0.30 to 0.90 in steps of 0.02
-        # Now using the CORRECT per-entity macro F-0.5
         best_thresh, best_score = 0.5, 0
         for thresh_int in range(30, 91, 2):
             thresh = thresh_int / 100.0
             preds = (preds_proba > thresh).astype(int)
             
-            # Build per-entity dicts for this fold's validation set
             val_s1_ids = df_val['source1_entity_id'].unique()
             y_true_dict = {}
             y_pred_dict = {}
             for s1_id in val_s1_ids:
-                # Get true matches from ground truth
                 gt_row = gt[gt['source1_entity_id'] == s1_id]
                 if len(gt_row) > 0:
                     matched = gt_row.iloc[0].get('matched_entity_ids', '')
@@ -145,7 +151,6 @@ def train_xgboost(df_features, labels, groups, output_dir, gt):
                     y_true_dict[s1_id] = set()
                 y_pred_dict[s1_id] = set()
             
-            # Fill predictions
             for i, (idx, row) in enumerate(df_val.iterrows()):
                 if preds[i] == 1:
                     s1_id = row['source1_entity_id']
@@ -169,10 +174,61 @@ def train_xgboost(df_features, labels, groups, output_dir, gt):
     print(f"\n>>> Average MACRO F-0.5 across folds: {avg_score:.4f}")
     print(f">>> Best single-fold MACRO F-0.5: {best_global_score:.4f} at threshold: {best_global_thresh}")
     
+    country_thresholds = {}
+    print("\n========== STRATIFIED THRESHOLDING (INDIA VS US) ==========")
+    if 'country_s1' in df_features.columns:
+        for country in ['india', 'us']:
+            c_mask = df_features['country_s1'].str.lower() == country
+            if not c_mask.any():
+                continue
+            
+            df_c = df_features[c_mask]
+            preds_c = oof_preds[c_mask]
+            
+            best_c_thresh, best_c_score = best_global_thresh, 0
+            for thresh_int in range(30, 91, 2):
+                thresh = thresh_int / 100.0
+                binary_preds = (preds_c > thresh).astype(int)
+                
+                c_s1_ids = df_c['source1_entity_id'].unique()
+                y_true_dict = {}
+                y_pred_dict = {}
+                for s1_id in c_s1_ids:
+                    gt_row = gt[gt['source1_entity_id'] == s1_id]
+                    if len(gt_row) > 0:
+                        matched = gt_row.iloc[0].get('matched_entity_ids', '')
+                        if pd.isna(matched) or matched == '':
+                            y_true_dict[s1_id] = set()
+                        else:
+                            y_true_dict[s1_id] = set(str(matched).split(','))
+                    else:
+                        y_true_dict[s1_id] = set()
+                    y_pred_dict[s1_id] = set()
+                
+                for i, (idx, row) in enumerate(df_c.iterrows()):
+                    if binary_preds[i] == 1:
+                        s1_id = row['source1_entity_id']
+                        cand_id = row['candidate_entity_id']
+                        if s1_id in y_pred_dict:
+                            y_pred_dict[s1_id].add(cand_id)
+                
+                score = f_05_per_entity(y_true_dict, y_pred_dict)
+                if score > best_c_score:
+                    best_c_score = score
+                    best_c_thresh = thresh
+            
+            country_thresholds[country] = best_c_thresh
+            print(f"{country.upper()} optimal threshold: {best_c_thresh} (score: {best_c_score:.4f})")
+    
     # Save models, threshold, and feature list
     model_path = os.path.join(output_dir, "xgb_model.pkl")
     with open(model_path, 'wb') as f:
-        pickle.dump({'models': models, 'threshold': best_global_thresh, 'features': feature_cols}, f)
+        pickle.dump({
+            'models': models, 
+            'threshold': best_global_thresh, 
+            'country_thresholds': country_thresholds,
+            'features': feature_cols
+        }, f)
     print(f"Models saved to {model_path}")
     
     return models, best_global_thresh, feature_cols
@@ -246,6 +302,16 @@ def main():
     print(f"Positive pairs (true matches): {df_pairs['is_true_match'].sum()}")
     print(f"Negative pairs (non-matches): {(df_pairs['is_true_match'] == 0).sum()}")
 
+    print("\n========== BLOCKING RECALL CEILING ==========")
+    total_true = len(gt_exploded)
+    found_true = df_pairs['is_true_match'].sum()
+    missed_true = total_true - found_true
+    recall_ceiling = (found_true / total_true * 100) if total_true > 0 else 0
+    print(f"Total true match pairs in ground truth: {total_true}")
+    print(f"How many were found by blocking: {found_true}")
+    print(f"How many were MISSED (never retrieved): {missed_true}")
+    print(f"Recall ceiling percentage: {recall_ceiling:.2f}%")
+
     # =================== FEATURE ENGINEERING ===================
     print("\n========== STAGE 2: FEATURE ENGINEERING ==========")
     df_features = build_features_for_pairs(df_pairs, df_s1, df_pool, blocker=blocker)
@@ -260,12 +326,16 @@ def main():
     if not args.skip_llm:
         print("\n========== LLM SNIPER (Borderline Arbitration) ==========")
         X_all = df_features[feature_cols]
-        all_proba = models[-1].predict_proba(X_all)[:, 1]
+        all_proba = np.zeros(len(X_all))
+        for m in models:
+            all_proba += m.predict_proba(X_all)[:, 1]
+        all_proba /= len(models)
+        
         df_features['xgb_prob'] = all_proba
         
-        borderline_mask = (all_proba >= 0.35) & (all_proba <= 0.65)
+        borderline_mask = (all_proba >= best_thresh - 0.15) & (all_proba <= best_thresh + 0.15)
         n_borderline = borderline_mask.sum()
-        print(f"Borderline pairs (0.35-0.65): {n_borderline}")
+        print(f"Borderline pairs (band around {best_thresh}): {n_borderline}")
         
         if n_borderline > 0 and n_borderline < 5000:
             try:

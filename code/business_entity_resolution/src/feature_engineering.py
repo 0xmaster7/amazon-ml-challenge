@@ -203,15 +203,16 @@ def build_features_for_pairs(df_pairs, df_s1, df_pool, blocker=None):
         df['cross_encoder_score'] = 0.0
 
     # ===========================================================
-    # DROP RAW STRING COLUMNS (keep only numeric features for XGBoost)
+    # DROP RAW STRING COLUMNS (keep only numeric features + country_s1 metadata)
     # ===========================================================
+    # Preserve country_s1 for stratified thresholding / country-specific evaluation
     string_cols = [c for c in df.columns if any(c.endswith(s) for s in
-                   ['_s1', '_cand']) and df[c].dtype == 'object']
+                   ['_s1', '_cand']) and df[c].dtype == 'object' and c != 'country_s1']
     # Also drop any leftover merge artifacts
     extra_drops = ['candidate_entity_ids', 'matched_entity_ids']
     for c in string_cols + extra_drops:
         if c in df.columns:
             df.drop(c, axis=1, inplace=True)
 
-    print(f"  Feature Engineering Complete. Total features: {len([c for c in df.columns if c not in ['source1_entity_id', 'candidate_entity_id', 'is_true_match']])}")
+    print(f"  Feature Engineering Complete. Total features: {len([c for c in df.columns if c not in ['source1_entity_id', 'candidate_entity_id', 'is_true_match', 'country_s1']])}")
     return df
