@@ -82,29 +82,66 @@ class LayeredBlocker:
         pool_texts = (df_pool['clean_name'] + " " + df_pool['clean_address']).tolist()
         s1_texts = (df_s1['clean_name'] + " " + df_s1['clean_address']).tolist()
         
-        print("Encoding pool...")
-        pool_embeddings = model.encode(pool_texts, show_progress_bar=True, normalize_embeddings=True, batch_size=256)
-        print("Encoding S1...")
-        s1_embeddings = model.encode(s1_texts, show_progress_bar=True, normalize_embeddings=True, batch_size=256)
+        # Dimensions for paraphrase-multilingual-MiniLM-L12-v2 is 384
+        d = 384 
+        import os, gc
         
-        # Store for reuse as XGBoost feature
-        self.pool_embeddings = pool_embeddings
-        self.s1_embeddings = s1_embeddings
+        print("Encoding pool in chunks with memmap...")
+        pool_mmap_path = "pool_embeddings.dat"
+        if os.path.exists(pool_mmap_path): os.remove(pool_mmap_path)
+        pool_embeddings = np.memmap(pool_mmap_path, dtype='float32', mode='w+', shape=(len(pool_texts), d))
+        
+        chunk_size = 500000
+        for i in range(0, len(pool_texts), chunk_size):
+            chunk = pool_texts[i:i+chunk_size]
+            print(f"  Encoding pool chunk {i} to {i+len(chunk)}...")
+            emb_chunk = model.encode(chunk, show_progress_bar=True, normalize_embeddings=True, batch_size=256)
+            pool_embeddings[i:i+len(chunk)] = emb_chunk
+            pool_embeddings.flush()
+            del emb_chunk, chunk
+            gc.collect()
+
+        print("Encoding S1...")
+        s1_mmap_path = "s1_embeddings.dat"
+        if os.path.exists(s1_mmap_path): os.remove(s1_mmap_path)
+        s1_embeddings = np.memmap(s1_mmap_path, dtype='float32', mode='w+', shape=(len(s1_texts), d))
+        
+        for i in range(0, len(s1_texts), chunk_size):
+            chunk = s1_texts[i:i+chunk_size]
+            print(f"  Encoding S1 chunk {i} to {i+len(chunk)}...")
+            emb_chunk = model.encode(chunk, show_progress_bar=True, normalize_embeddings=True, batch_size=256)
+            s1_embeddings[i:i+len(chunk)] = emb_chunk
+            s1_embeddings.flush()
+            del emb_chunk, chunk
+            gc.collect()
+            
+        # Store memmap for reuse as XGBoost feature
+        self.pool_embeddings = np.memmap(pool_mmap_path, dtype='float32', mode='r', shape=(len(pool_texts), d))
+        self.s1_embeddings = np.memmap(s1_mmap_path, dtype='float32', mode='r', shape=(len(s1_texts), d))
+        
         self.pool_ids = df_pool['entity_id'].values
         self.s1_ids = df_s1['entity_id'].values
         
-        d = pool_embeddings.shape[1]
+        print("Building FAISS index iteratively...")
         index = faiss.IndexFlatIP(d)
-        index.add(np.array(pool_embeddings).astype('float32'))
         
-        # k=50 because max fan-out in ground truth is 7, need big safety margin
-        D, I = index.search(np.array(s1_embeddings).astype('float32'), k=50)
+        # Add to FAISS in chunks to avoid memory explosion
+        for i in range(0, len(self.pool_embeddings), chunk_size):
+            index.add(np.array(self.pool_embeddings[i:i+chunk_size]).astype('float32'))
         
-        for i, s1_id in enumerate(self.s1_ids):
-            for j in range(50):
-                if I[i][j] >= 0 and D[i][j] > 0.5:  # Lowered threshold for recall
-                    cand_id = self.pool_ids[I[i][j]]
-                    self._add_pair(s1_id, cand_id, 'layer3_faiss', faiss_rank=j, faiss_score=float(D[i][j]))
+        print("Searching FAISS index...")
+        # Search in chunks
+        for i in range(0, len(self.s1_embeddings), chunk_size):
+            q_chunk = np.array(self.s1_embeddings[i:i+chunk_size]).astype('float32')
+            D_chunk, I_chunk = index.search(q_chunk, k=50)
+            for chunk_idx, s1_id in enumerate(self.s1_ids[i:i+chunk_size]):
+                for j in range(50):
+                    if I_chunk[chunk_idx][j] >= 0 and D_chunk[chunk_idx][j] > 0.5:
+                        cand_id = self.pool_ids[I_chunk[chunk_idx][j]]
+                        self._add_pair(s1_id, cand_id, 'layer3_faiss', faiss_rank=j, faiss_score=float(D_chunk[chunk_idx][j]))
+            del q_chunk, D_chunk, I_chunk
+            gc.collect()
+            
         print(f"Layer 3 complete. Total pairs so far: {len(self.candidate_pairs)}")
 
     def layer4_address_only(self, df_s1, df_s2, df_s3):
