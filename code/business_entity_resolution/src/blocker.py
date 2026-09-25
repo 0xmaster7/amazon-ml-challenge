@@ -86,62 +86,94 @@ class LayeredBlocker:
         d = 384 
         import os, gc
         
-        print("Encoding pool in chunks with memmap...")
+        # Check if pool embeddings already exist on disk from previous run
         pool_mmap_path = "pool_embeddings.dat"
-        if os.path.exists(pool_mmap_path): os.remove(pool_mmap_path)
-        pool_embeddings = np.memmap(pool_mmap_path, dtype='float32', mode='w+', shape=(len(pool_texts), d))
-        
-        chunk_size = 500000
-        for i in range(0, len(pool_texts), chunk_size):
-            chunk = pool_texts[i:i+chunk_size]
-            print(f"  Encoding pool chunk {i} to {i+len(chunk)}...")
-            emb_chunk = model.encode(chunk, show_progress_bar=True, normalize_embeddings=True, batch_size=256)
-            pool_embeddings[i:i+len(chunk)] = emb_chunk
-            pool_embeddings.flush()
-            del emb_chunk, chunk
+        expected_pool_bytes = len(pool_texts) * d * 4
+        if os.path.exists(pool_mmap_path) and os.path.getsize(pool_mmap_path) == expected_pool_bytes:
+            print(f"Found existing {pool_mmap_path} ({os.path.getsize(pool_mmap_path) / 1e9:.2f} GB). Skipping pool encoding!")
+        else:
+            print("Encoding pool in chunks with memmap...")
+            if os.path.exists(pool_mmap_path): os.remove(pool_mmap_path)
+            pool_embeddings = np.memmap(pool_mmap_path, dtype='float32', mode='w+', shape=(len(pool_texts), d))
+            
+            chunk_size = 500000
+            for i in range(0, len(pool_texts), chunk_size):
+                chunk = pool_texts[i:i+chunk_size]
+                print(f"  Encoding pool chunk {i} to {i+len(chunk)}...")
+                emb_chunk = model.encode(chunk, show_progress_bar=True, normalize_embeddings=True, batch_size=256)
+                pool_embeddings[i:i+len(chunk)] = emb_chunk
+                pool_embeddings.flush()
+                del emb_chunk, chunk
+                gc.collect()
+            del pool_embeddings
             gc.collect()
 
-        print("Encoding S1...")
+        # Check if S1 embeddings already exist on disk from previous run
         s1_mmap_path = "s1_embeddings.dat"
-        if os.path.exists(s1_mmap_path): os.remove(s1_mmap_path)
-        s1_embeddings = np.memmap(s1_mmap_path, dtype='float32', mode='w+', shape=(len(s1_texts), d))
-        
-        for i in range(0, len(s1_texts), chunk_size):
-            chunk = s1_texts[i:i+chunk_size]
-            print(f"  Encoding S1 chunk {i} to {i+len(chunk)}...")
-            emb_chunk = model.encode(chunk, show_progress_bar=True, normalize_embeddings=True, batch_size=256)
-            s1_embeddings[i:i+len(chunk)] = emb_chunk
-            s1_embeddings.flush()
-            del emb_chunk, chunk
-            gc.collect()
+        expected_s1_bytes = len(s1_texts) * d * 4
+        if os.path.exists(s1_mmap_path) and os.path.getsize(s1_mmap_path) == expected_s1_bytes:
+            print(f"Found existing {s1_mmap_path} ({os.path.getsize(s1_mmap_path) / 1e9:.2f} GB). Skipping S1 encoding!")
+        else:
+            print("Encoding S1 in chunks with memmap...")
+            if os.path.exists(s1_mmap_path): os.remove(s1_mmap_path)
+            s1_embeddings = np.memmap(s1_mmap_path, dtype='float32', mode='w+', shape=(len(s1_texts), d))
             
-        # Store memmap for reuse as XGBoost feature
-        self.pool_embeddings = np.memmap(pool_mmap_path, dtype='float32', mode='r', shape=(len(pool_texts), d))
-        self.s1_embeddings = np.memmap(s1_mmap_path, dtype='float32', mode='r', shape=(len(s1_texts), d))
-        
+            chunk_size = 500000
+            for i in range(0, len(s1_texts), chunk_size):
+                chunk = s1_texts[i:i+chunk_size]
+                print(f"  Encoding S1 chunk {i} to {i+len(chunk)}...")
+                emb_chunk = model.encode(chunk, show_progress_bar=True, normalize_embeddings=True, batch_size=256)
+                s1_embeddings[i:i+len(chunk)] = emb_chunk
+                s1_embeddings.flush()
+                del emb_chunk, chunk
+                gc.collect()
+            del s1_embeddings
+            gc.collect()
+
         self.pool_ids = df_pool['entity_id'].values
         self.s1_ids = df_s1['entity_id'].values
-        
-        print("Building FAISS index iteratively...")
-        index = faiss.IndexFlatIP(d)
-        
-        # Add to FAISS in chunks to avoid memory explosion
-        for i in range(0, len(self.pool_embeddings), chunk_size):
-            index.add(np.array(self.pool_embeddings[i:i+chunk_size]).astype('float32'))
-        
-        print("Searching FAISS index...")
-        # Search in chunks
-        for i in range(0, len(self.s1_embeddings), chunk_size):
-            q_chunk = np.array(self.s1_embeddings[i:i+chunk_size]).astype('float32')
-            D_chunk, I_chunk = index.search(q_chunk, k=50)
-            for chunk_idx, s1_id in enumerate(self.s1_ids[i:i+chunk_size]):
-                for j in range(50):
-                    if I_chunk[chunk_idx][j] >= 0 and D_chunk[chunk_idx][j] > 0.5:
-                        cand_id = self.pool_ids[I_chunk[chunk_idx][j]]
-                        self._add_pair(s1_id, cand_id, 'layer3_faiss', faiss_rank=j, faiss_score=float(D_chunk[chunk_idx][j]))
-            del q_chunk, D_chunk, I_chunk
-            gc.collect()
+        n_pool = len(self.pool_ids)
+        n_s1 = len(self.s1_ids)
+
+        # Free heavy Python objects to maximize RAM before FAISS
+        del pool_texts, s1_texts, df_pool
+        gc.collect()
+
+        # Store memmap for reuse as XGBoost feature
+        self.pool_embeddings = np.memmap(pool_mmap_path, dtype='float32', mode='r', shape=(n_pool, d))
+        self.s1_embeddings = np.memmap(s1_mmap_path, dtype='float32', mode='r', shape=(n_s1, d))
+        self.pool_id_to_idx = {pid: i for i, pid in enumerate(self.pool_ids)}
+        self.s1_id_to_idx = {sid: i for i, sid in enumerate(self.s1_ids)}
+
+        # Search FAISS in slices of 2.5M vectors (~3.8 GB each) so RAM NEVER spikes
+        print("Searching FAISS in memory-safe slices...")
+        pool_slice_size = 2500000
+        s1_search_batch = 100000
+
+        for p_start in range(0, n_pool, pool_slice_size):
+            p_end = min(p_start + pool_slice_size, n_pool)
+            print(f"  Indexing pool slice [{p_start}:{p_end}] ({p_end - p_start} vectors)...")
+            sub_index = faiss.IndexFlatIP(d)
+            sub_index.add(np.array(self.pool_embeddings[p_start:p_end]).astype('float32'))
             
+            print(f"  Searching S1 against pool slice [{p_start}:{p_end}]...")
+            for s_start in range(0, n_s1, s1_search_batch):
+                s_end = min(s_start + s1_search_batch, n_s1)
+                q_chunk = np.array(self.s1_embeddings[s_start:s_end]).astype('float32')
+                D_chunk, I_chunk = sub_index.search(q_chunk, k=50)
+                
+                for idx, s1_id in enumerate(self.s1_ids[s_start:s_end]):
+                    for j in range(50):
+                        score = float(D_chunk[idx][j])
+                        match_idx = I_chunk[idx][j]
+                        if match_idx >= 0 and score > 0.5:
+                            cand_id = self.pool_ids[p_start + match_idx]
+                            self._add_pair(s1_id, cand_id, 'layer3_faiss', faiss_rank=j, faiss_score=score)
+                del q_chunk, D_chunk, I_chunk
+            
+            del sub_index
+            gc.collect()
+
         print(f"Layer 3 complete. Total pairs so far: {len(self.candidate_pairs)}")
 
     def layer4_address_only(self, df_s1, df_s2, df_s3):
@@ -165,11 +197,11 @@ class LayeredBlocker:
         if self.s1_embeddings is None or self.pool_embeddings is None:
             return 0.0
         try:
-            s1_idx = np.where(self.s1_ids == s1_id)[0]
-            pool_idx = np.where(self.pool_ids == cand_id)[0]
-            if len(s1_idx) == 0 or len(pool_idx) == 0:
+            s1_idx = self.s1_id_to_idx.get(s1_id)
+            pool_idx = self.pool_id_to_idx.get(cand_id)
+            if s1_idx is None or pool_idx is None:
                 return 0.0
-            return float(np.dot(self.s1_embeddings[s1_idx[0]], self.pool_embeddings[pool_idx[0]]))
+            return float(np.dot(self.s1_embeddings[s1_idx], self.pool_embeddings[pool_idx]))
         except Exception:
             return 0.0
 
