@@ -11,7 +11,7 @@ import numpy as np
 import os
 import argparse
 import pickle
-from data_cleaner import process_dataframe
+from data_cleaner import process_dataframe, slim_frame, mem_rss
 from blocker import LayeredBlocker
 from feature_engineering import build_features_for_pairs
 from llm_sniper import LLMSniper
@@ -38,7 +38,7 @@ def load_ckpt(ckpt_dir, name):
 
 def row_countries(df_features, df_s1):
     m = df_s1.set_index('entity_id')['country_norm']
-    return df_features['source1_entity_id'].map(m).fillna('').values
+    return df_features['source1_entity_id'].map(m).astype(object).fillna('').values
 
 
 def apply_thresholds(row_country, proba, thresholds):
@@ -88,7 +88,9 @@ def main():
         df_s2 = process_dataframe(pd.read_csv(os.path.join(args.test_dir, "test_source2.tsv"), sep="\t"))
         df_s3 = process_dataframe(pd.read_csv(os.path.join(args.test_dir, "test_source3.tsv"), sep="\t"))
         save_ckpt(ckpt_dir, "cleaned_test.pkl", (df_s1, df_s2, df_s3))
-    df_pool = pd.concat([df_s2, df_s3]).reset_index(drop=True)
+    df_s1, df_s2, df_s3 = slim_frame(df_s1), slim_frame(df_s2), slim_frame(df_s3)
+    df_pool = pd.concat([df_s2[['entity_id', 'business_name', 'clean_name', 'expanded_name', 'clean_address', 'raw_address', 'country', 'country_norm', 'extracted_pin', 'house_number', 'street_tokens', 'city_tag', 'state_tag', 'phone_keys']], df_s3[['entity_id', 'business_name', 'clean_name', 'expanded_name', 'clean_address', 'raw_address', 'country', 'country_norm', 'extracted_pin', 'house_number', 'street_tokens', 'city_tag', 'state_tag', 'phone_keys']]]).reset_index(drop=True)
+    print(f"[mem {mem_rss():.1f}GB] cleaned test data loaded/slimmed")
 
     all_s1_ids = set(df_s1['entity_id'].values)
     all_pool_ids = set(df_pool['entity_id'].values)

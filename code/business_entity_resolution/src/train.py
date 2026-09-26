@@ -6,7 +6,7 @@ import pickle
 import gc
 import xgboost as xgb
 from sklearn.model_selection import StratifiedGroupKFold
-from data_cleaner import process_dataframe
+from data_cleaner import process_dataframe, slim_frame, mem_rss
 from blocker import LayeredBlocker
 from feature_engineering import build_features_for_pairs
 from scorer import build_true_dict, macro_score_from_proba
@@ -186,7 +186,11 @@ def main():
         df_s2 = process_dataframe(pd.read_csv(os.path.join(args.data_dir, "train_source2.tsv"), sep="\t", nrows=nrows))
         df_s3 = process_dataframe(pd.read_csv(os.path.join(args.data_dir, "train_source3.tsv"), sep="\t", nrows=nrows))
         save_ckpt(ckpt_dir, "cleaned_train.pkl", (df_s1, df_s2, df_s3))
-    df_pool = pd.concat([df_s2, df_s3]).reset_index(drop=True)
+    # Slim even checkpoint-loaded frames (older checkpoints carry the fat columns)
+    df_s1, df_s2, df_s3 = slim_frame(df_s1), slim_frame(df_s2), slim_frame(df_s3)
+    print(f"[mem {mem_rss():.1f}GB] cleaned data loaded/slimmed")
+    # df_pool is built AFTER blocking with only the columns the feature
+    # stage needs - embed_text/name_first_token stay out of it.
 
     gt = pd.read_csv(os.path.join(args.data_dir, "train_ground_truth.tsv"), sep="\t")
 
@@ -251,6 +255,12 @@ def main():
         df_pairs = blocker_keep.export_candidate_pairs(os.path.join(args.output_dir, "candidate_pairs.tsv"))
         save_ckpt(ckpt_dir, "pairs_train.pkl", df_pairs)
 
+    # Trimmed pool for the feature stage, then the raw source frames go away.
+    df_pool = pd.concat([df_s2[['entity_id', 'business_name', 'clean_name', 'expanded_name', 'clean_address', 'raw_address', 'country', 'country_norm', 'extracted_pin', 'house_number', 'street_tokens', 'city_tag', 'state_tag', 'phone_keys']], df_s3[['entity_id', 'business_name', 'clean_name', 'expanded_name', 'clean_address', 'raw_address', 'country', 'country_norm', 'extracted_pin', 'house_number', 'street_tokens', 'city_tag', 'state_tag', 'phone_keys']]]).reset_index(drop=True)
+    del df_s2, df_s3
+    gc.collect()
+    print(f"[mem {mem_rss():.1f}GB] blocking done, pool trimmed, s2/s3 freed")
+
     # =================== GROUND TRUTH LABELING ===================
     print("\n========== LABELING CANDIDATES ==========")
     gt_exploded = gt_non_empty.assign(
@@ -290,7 +300,7 @@ def main():
     print("Every recall point lost here is unrecoverable downstream.")
 
     # =================== FEATURE ENGINEERING ===================
-    print("\n========== STAGE 2: FEATURE ENGINEERING ==========")
+    print(f"\n========== STAGE 2: FEATURE ENGINEERING ========== [mem {mem_rss():.1f}GB]")
     df_features = load_ckpt(ckpt_dir, "features_train.pkl") if args.resume else None
     if df_features is None:
         df_features = build_features_for_pairs(df_pairs, df_s1, df_pool, blocker=blocker_keep,
@@ -304,7 +314,7 @@ def main():
 
     # =================== TRAIN XGBOOST ===================
     strata = df_features['source1_entity_id'].map(
-        df_s1.set_index('entity_id')['country_norm']).fillna('').values
+        df_s1.set_index('entity_id')['country_norm']).astype(object).fillna('').values
     models, thresholds, feature_cols, oof_proba = train_xgboost(
         df_features, df_features['is_true_match'], df_features['source1_entity_id'],
         strata, args.output_dir, gt, seeds, args.stratify, args.no_spw

@@ -1,5 +1,18 @@
 import pandas as pd
 import re
+import os
+
+def mem_rss():
+    # Current process RSS in GB, no dependencies (reads /proc).
+    try:
+        with open('/proc/self/status') as f:
+            for line in f:
+                if line.startswith('VmRSS'):
+                    return int(line.split()[1]) / 1e6
+    except Exception:
+        return -1.0
+    return -1.1
+
 
 # ============================================================
 # CITY ALIAS MAP (India + France)
@@ -255,8 +268,35 @@ def process_dataframe(df):
     df['city_tag'] = df['clean_address'].apply(detect_city)
     df['state_tag'] = df['raw_address'].apply(detect_state)
 
-    # Phone / tax-ID keys from the RAW record text (name+address) for blocking
-    df['phone_keys'] = [(extract_phone_keys(n) + extract_phone_keys(a))
+    # Phone / tax-ID keys from the RAW record text (name+address) for blocking.
+    # Stored as a space-joined string, not a list - millions of tiny list
+    # objects cost ~600MB of pure overhead on a 10M-row pool.
+    df['phone_keys'] = [" ".join(extract_phone_keys(n) + extract_phone_keys(a))
                         for n, a in zip(df['business_name'], df['business_address'])]
 
+    return slim_frame(df)
+
+
+# Columns no stage needs after cleaning is done (raw_address keeps the
+# pre-clean address; raw text for the embedder lives in embed_text).
+_DROP_AFTER_CLEAN = ['business_address']
+# Low-cardinality columns: category dtype replaces a Python string object
+# per row with a small int code - the single biggest memory lever on
+# 10M-row frames.
+_CATEGORICAL_COLS = ['country', 'country_norm', 'city_tag', 'state_tag',
+                     'extracted_pin', 'name_first_token', 'house_number']
+
+
+def slim_frame(df):
+    # Shrink a cleaned frame's RAM footprint. Idempotent - safe to re-apply
+    # to frames loaded from an old checkpoint.
+    for c in _DROP_AFTER_CLEAN:
+        if c in df.columns:
+            df.drop(columns=[c], inplace=True)
+    if 'phone_keys' in df.columns and df['phone_keys'].map(lambda v: isinstance(v, list)).any():
+        df['phone_keys'] = df['phone_keys'].map(
+            lambda v: " ".join(v) if isinstance(v, list) else (v if isinstance(v, str) else ""))
+    for c in _CATEGORICAL_COLS:
+        if c in df.columns and str(df[c].dtype) != 'category':
+            df[c] = df[c].astype('category')
     return df

@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 import re
 from rapidfuzz import fuzz, distance
+from data_cleaner import mem_rss
 
 # Multilingual cross-encoder (14 languages incl. French/Hindi scripts).
 # FIXED: was cross-encoder/ms-marco-MiniLM-L-6-v2 - an ENGLISH passage ranker.
@@ -93,6 +94,9 @@ def _build_features_chunk(df_pairs, df_s1, df_pool, blocker=None, use_cross_enco
     df = df.merge(df_pool[merge_cols_pool], left_on='candidate_entity_id', right_on='entity_id', how='left')
     df.rename(columns={c: c + '_cand' for c in merge_cols_pool if c != 'entity_id'}, inplace=True)
     df.drop('entity_id', axis=1, inplace=True)
+    for c in df.columns:
+        if str(df[c].dtype) == 'category':
+            df[c] = df[c].astype(object)
     df.fillna("", inplace=True)
 
     # ===========================================================
@@ -205,7 +209,11 @@ def _build_features_chunk(df_pairs, df_s1, df_pool, blocker=None, use_cross_enco
     df['state_match'] = [_state_match(a, b) for a, b in zip(df['state_tag_s1'], df['state_tag_cand'])]
 
     # Shared phone/tax-ID key (7+ digit run) - very strong signal when present
-    df['phone_key_match'] = [1 if set(a if isinstance(a, list) else []) & set(b if isinstance(b, list) else []) else 0
+    def _pk(v):
+        if isinstance(v, str):
+            return set(v.split())
+        return set(v) if isinstance(v, list) else set()
+    df['phone_key_match'] = [1 if _pk(a) & _pk(b) else 0
                              for a, b in zip(df['phone_keys_s1'], df['phone_keys_cand'])]
 
     df['is_s3_candidate'] = df['candidate_entity_id'].astype(str).str.startswith('S3').astype(int)
@@ -273,7 +281,7 @@ def build_features_for_pairs(df_pairs, df_s1, df_pool, blocker=None,
         cross_model = CrossEncoder(CROSS_ENCODER_MODEL, max_length=128)
     parts = []
     for ci, start in enumerate(range(0, n, chunk_size)):
-        print(f"  Feature chunk {ci + 1}/{n_chunks}...")
+        print(f"  Feature chunk {ci + 1}/{n_chunks}... [mem {mem_rss():.1f}GB]")
         part = _build_features_chunk(
             df_pairs.iloc[start:start + chunk_size].copy(), df_s1, df_pool,
             blocker=blocker, use_cross_encoder=use_cross_encoder,

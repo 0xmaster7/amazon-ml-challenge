@@ -242,3 +242,33 @@ Fixes in blocker.py:
 - (from v2.4) 2^24 hash buckets + sub-threshold compaction before COO.
 Verified: 500/500 typo recall, multi-chunk path exercised, scratch files
 cleaned up, 0.44GB sandbox peak. Layer 5 phone blocking confirmed working.
+
+---
+
+# v2.6 hotfix (baseline RAM: slim cleaned frames + memory telemetry)
+
+The three v2.2-v2.5 fixes bounded Layer 2's working set, but the BASELINE
+load - the cleaned dataframes themselves (~19 object columns x 12.5M rows) -
+was still eating most of the 13GB box before any blocking math ran.
+
+- data_cleaner.process_dataframe now returns slim frames: business_address
+  originals dropped (raw_address/embed_text carry what stages need),
+  phone_keys stored as joined strings (millions of tiny list objects cost
+  ~600MB pure overhead), and low-cardinality columns (country, country_norm,
+  city_tag, state_tag, extracted_pin, name_first_token, house_number) cast to
+  category dtype - int codes instead of a Python string object per row.
+- slim_frame() is idempotent and re-applied to frames loaded from OLD
+  checkpoints in both train.py and predict.py, so existing cleaned_train.pkl
+  still works and gets slimmed on load.
+- train.py: df_pool is now built AFTER blocking from only the 14 columns the
+  feature stage needs (embed_text/name_first_token excluded), then the raw
+  s2/s3 frames are freed before feature engineering. predict.py trims the
+  same way.
+- Memory telemetry: every blocking layer, feature chunk, and stage boundary
+  prints [mem X.XGB] (VmRSS from /proc, no deps). The next run's log shows
+  exactly where the GBs are.
+- Compatibility fixes for the new dtypes: L1 merge keys cast to str, L4b
+  groupby observed=True, category->object before fillna in features,
+  strata/country maps cast to object before fillna.
+- Verified: full pipeline on synthetic data (all 6 layers, chunked features,
+  100/100 recall), smoke tests pass, pyflakes clean.

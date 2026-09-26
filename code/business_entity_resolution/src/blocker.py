@@ -5,6 +5,7 @@ import gc
 import json
 import hashlib
 import pickle
+from data_cleaner import mem_rss
 
 class LayeredBlocker:
     def __init__(self):
@@ -53,15 +54,16 @@ class LayeredBlocker:
         pool_valid = df_pool[(df_pool['extracted_pin'] != "") & (df_pool['name_first_token'] != "")]
         s1_valid = df_s1[(df_s1['extracted_pin'] != "") & (df_s1['name_first_token'] != "")]
 
+        k = {'name_first_token': str, 'extracted_pin': str}
         merged = pd.merge(
-            s1_valid[['entity_id', 'name_first_token', 'extracted_pin']],
-            pool_valid[['entity_id', 'name_first_token', 'extracted_pin']],
+            s1_valid[['entity_id', 'name_first_token', 'extracted_pin']].astype(k),
+            pool_valid[['entity_id', 'name_first_token', 'extracted_pin']].astype(k),
             on=['name_first_token', 'extracted_pin'],
             suffixes=('_s1', '_cand')
         )
         for _, row in merged.iterrows():
             self._add_pair(row['entity_id_s1'], row['entity_id_cand'], 'layer1_exact')
-        print(f"Layer 1 complete. Total pairs so far: {len(self.candidate_pairs)}")
+        print(f"[mem {mem_rss():.1f}GB] Layer 1 complete. Total pairs so far: {len(self.candidate_pairs)}")
 
     def layer2_tfidf_blocking(self, df_s1, df_s2, df_s3,
                               sim_threshold=0.45, top_k=30,
@@ -175,7 +177,7 @@ class LayeredBlocker:
             for pidx, score in sorted(row.items(), key=lambda t: -t[1])[:top_k]:
                 self._add_pair(s1_id, pool_ids[pidx], 'layer2_tfidf')
                 n_added += 1
-        print(f"Layer 2 complete. Added {n_added} pairs. Total pairs so far: {len(self.candidate_pairs)}")
+        print(f"[mem {mem_rss():.1f}GB] Layer 2 complete. Added {n_added} pairs. Total pairs so far: {len(self.candidate_pairs)}")
 
     def _embed_cache_key(self, model_name, ids, texts):
         """Content-derived cache key for the memmap embedding cache.
@@ -363,7 +365,7 @@ class LayeredBlocker:
                 del sub_index
                 gc.collect()
 
-        print(f"Layer 3 complete. Total pairs so far: {len(self.candidate_pairs)}")
+        print(f"[mem {mem_rss():.1f}GB] Layer 3 complete. Total pairs so far: {len(self.candidate_pairs)}")
 
     def layer4_address_only(self, df_s1, df_s2, df_s3):
         print("Running Layer 4: Address-Only Fallback...")
@@ -380,7 +382,7 @@ class LayeredBlocker:
         )
         for _, row in merged.iterrows():
             self._add_pair(row['entity_id_s1'], row['entity_id_cand'], 'layer4_address')
-        print(f"Layer 4 complete. Total pairs so far: {len(self.candidate_pairs)}")
+        print(f"[mem {mem_rss():.1f}GB] Layer 4 complete. Total pairs so far: {len(self.candidate_pairs)}")
 
     def layer4b_near_exact_address(self, df_s1, df_s2, df_s3, jaccard_threshold=0.85,
                                    max_block=2000):
@@ -397,12 +399,12 @@ class LayeredBlocker:
         pool = pd.concat([df_s2[['entity_id', 'extracted_pin', 'street_tokens']],
                           df_s3[['entity_id', 'extracted_pin', 'street_tokens']]])
         pool_by_pin = {}
-        for pin, grp in pool[pool['extracted_pin'] != ""].groupby('extracted_pin'):
+        for pin, grp in pool[pool['extracted_pin'] != ""].groupby('extracted_pin', observed=True):
             pool_by_pin[pin] = [(r['entity_id'], tokset(r['street_tokens']))
                                 for _, r in grp.iterrows()]
 
         n_added = 0
-        for pin, grp in df_s1[df_s1['extracted_pin'] != ""].groupby('extracted_pin'):
+        for pin, grp in df_s1[df_s1['extracted_pin'] != ""].groupby('extracted_pin', observed=True):
             cands = pool_by_pin.get(pin)
             if not cands or len(cands) > max_block or len(grp) > max_block:
                 continue
@@ -417,7 +419,7 @@ class LayeredBlocker:
                     if inter and inter / len(t1 | t2) >= jaccard_threshold:
                         self._add_pair(r['entity_id'], cid, 'layer4b_near_address')
                         n_added += 1
-        print(f"Layer 4b complete. Added {n_added} pairs. Total pairs so far: {len(self.candidate_pairs)}")
+        print(f"[mem {mem_rss():.1f}GB] Layer 4b complete. Added {n_added} pairs. Total pairs so far: {len(self.candidate_pairs)}")
 
     def layer5_phone_key_blocking(self, df_s1, df_s2, df_s3):
         """Blocks on shared long digit runs (phone / tax-ID / registration
@@ -431,7 +433,10 @@ class LayeredBlocker:
         def explode(df):
             rows = []
             for _, r in df.iterrows():
-                for k in (r['phone_keys'] or []):
+                keys = r['phone_keys']
+                if isinstance(keys, str):
+                    keys = keys.split()
+                for k in (keys or []):
                     rows.append((k, r['entity_id']))
             return rows
 
@@ -445,7 +450,7 @@ class LayeredBlocker:
                 for cid in pool_idx.get(k, []):
                     self._add_pair(r['entity_id'], cid, 'layer5_phonekey')
                     n_added += 1
-        print(f"Layer 5 complete. Added {n_added} pairs. Total pairs so far: {len(self.candidate_pairs)}")
+        print(f"[mem {mem_rss():.1f}GB] Layer 5 complete. Added {n_added} pairs. Total pairs so far: {len(self.candidate_pairs)}")
 
     def get_embedding_cosine_sim(self, s1_id, cand_id):
         """Returns the precomputed cosine similarity between an S1 and candidate embedding."""
