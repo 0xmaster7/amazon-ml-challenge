@@ -221,3 +221,24 @@ Not implemented, with reason:
 - Verified: 500/500 typo recall on realistic distinct-name synthetic data,
   0.45GB peak. Pool dedup by entity_id is the only safe shrink - two rows
   with identical text but different entity_ids are still distinct candidates.
+
+---
+
+# v2.5 hotfix (Layer 2 OOM, third strike - structural fix)
+
+Root cause was structural, not tuning. Three full copies of the data were
+alive at the matching step: the original cleaned frames (df_s2/df_s3, ~19
+object columns each), a full-frame pd.concat copy of them, and pool_texts/
+s1_texts lists copying all the text again - plus the entire S1 TF-IDF matrix
+Q resident in RAM. On a 10.4M-row pool that exceeds 13GB before any slice
+math runs.
+
+Fixes in blocker.py:
+- Every layer now concatenates ONLY the columns it uses (3 max), not whole
+  frames: layers 1, 3, 4, 4b, 5 and 2.
+- Layer 2 builds text slices on demand - no pool_texts/s1_texts lists.
+- The S1 matrix Q is written to disk in .npz chunks and loaded one chunk at
+  a time during matching - constant RAM regardless of source1 size.
+- (from v2.4) 2^24 hash buckets + sub-threshold compaction before COO.
+Verified: 500/500 typo recall, multi-chunk path exercised, scratch files
+cleaned up, 0.44GB sandbox peak. Layer 5 phone blocking confirmed working.

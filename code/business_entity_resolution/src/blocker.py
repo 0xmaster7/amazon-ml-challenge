@@ -48,7 +48,8 @@ class LayeredBlocker:
 
     def layer1_exact_key_blocking(self, df_s1, df_s2, df_s3):
         print("Running Layer 1: Exact Key Blocking...")
-        df_pool = pd.concat([df_s2, df_s3])
+        df_pool = pd.concat([df_s2[['entity_id', 'name_first_token', 'extracted_pin']],
+                             df_s3[['entity_id', 'name_first_token', 'extracted_pin']]])
         pool_valid = df_pool[(df_pool['extracted_pin'] != "") & (df_pool['name_first_token'] != "")]
         s1_valid = df_s1[(df_s1['extracted_pin'] != "") & (df_s1['name_first_token'] != "")]
 
@@ -64,45 +65,50 @@ class LayeredBlocker:
 
     def layer2_tfidf_blocking(self, df_s1, df_s2, df_s3,
                               sim_threshold=0.45, top_k=30,
-                              pool_slice=100000, s1_batch=10000,
+                              pool_slice=100000, s1_batch=200000,
                               n_features=2 ** 24):
-        """Typo safety net via TF-IDF over character n-grams, MEMORY-BOUNDED.
+        """Typo safety net via TF-IDF over character n-grams, CONSTANT-memory.
 
-        v2.2 rewrite: the old version used TfidfVectorizer.fit_transform over
-        ~2.2M records, which built a multi-GB vocabulary dict + full sparse
-        matrix and got the process OOM-killed on a 13GB Kaggle box. This
-        version:
-          - HashingVectorizer: no vocabulary dict at all (stateless).
-          - Two sliced passes: idf counts first, then per-slice matching -
-            the full pool matrix is never materialized.
-          - Hits are pruned to ~top_k per entity as they accumulate.
-        Recall impact is negligible: hash collisions at 2^24 buckets are rare
-        and the sim math (cosine over char n-gram tf-idf) is unchanged.
+        v2.5 rewrite after three OOM kills at this layer on a 13GB Kaggle box.
+        The earlier versions' real peaks were structural, not tuning:
+          1. pd.concat([df_s2, df_s3]) copied ALL ~19 object columns of the
+             10M-row pool - a full second copy of the cleaned frames.
+          2. pool_texts/s1_texts lists were a THIRD copy of all the text.
+          3. The whole S1 TF-IDF matrix Q lived in RAM.
+        Now: only the 3 needed columns are concatenated, text slices are built
+        on demand, and Q is built in chunks saved to disk and loaded one chunk
+        at a time during matching. HashingVectorizer (no vocab dict), 2^24
+        buckets (collision noise negligible), sub-threshold entries compacted
+        before any COO materialization. Same cosine math - recall unchanged.
         """
         from sklearn.feature_extraction.text import HashingVectorizer
         from sklearn.preprocessing import normalize
         import scipy.sparse as sp
 
-        print("Running Layer 2: TF-IDF char-n-gram blocking (memory-bounded)...")
-        df_pool = pd.concat([df_s2, df_s3]).drop_duplicates('entity_id')
-        pool_texts = (df_pool['clean_name'] + " " + df_pool['clean_address']).tolist()
-        s1_texts = (df_s1['clean_name'] + " " + df_s1['clean_address']).tolist()
+        print("Running Layer 2: TF-IDF char-n-gram blocking (constant-memory)...")
+        df_pool = pd.concat([
+            df_s2[['entity_id', 'clean_name', 'clean_address']],
+            df_s3[['entity_id', 'clean_name', 'clean_address']],
+        ]).drop_duplicates('entity_id').reset_index(drop=True)
         pool_ids = df_pool['entity_id'].values
         s1_ids_arr = df_s1['entity_id'].values
-        n_pool = len(pool_texts)
-        n_s1 = len(s1_texts)
+        n_pool = len(df_pool)
+        n_s1 = len(df_s1)
         N = n_pool + n_s1
 
         vec = HashingVectorizer(analyzer='char_wb', ngram_range=(3, 5),
                                 n_features=n_features, norm=None,
                                 alternate_sign=False, dtype=np.float32)
 
-        # Pass 1: document frequency per feature, slice by slice.
-        print(f"  Pass 1/2: idf counts over {N} records in {pool_slice}-row slices...")
+        def slice_texts(df, a, b):
+            return (df['clean_name'].iloc[a:b] + " " + df['clean_address'].iloc[a:b]).tolist()
+
+        # Pass 1: document frequency per bucket, slice by slice.
+        print(f"  Pass 1/3: idf counts over {N} records in {pool_slice}-row slices...")
         df_counts = np.zeros(n_features, dtype=np.float64)
-        for texts in (pool_texts, s1_texts):
-            for i in range(0, len(texts), pool_slice):
-                X = vec.transform(texts[i:i + pool_slice])
+        for df_ in (df_pool, df_s1):
+            for i in range(0, len(df_), pool_slice):
+                X = vec.transform(slice_texts(df_, i, min(i + pool_slice, len(df_))))
                 X.data[:] = 1.0  # binarize -> document frequency
                 df_counts += np.asarray(X.sum(axis=0)).ravel()
                 del X
@@ -111,43 +117,46 @@ class LayeredBlocker:
         del df_counts
         gc.collect()
 
-        # Materialize Q (S1 side) once - it is the smaller side.
-        print(f"  Building normalized TF-IDF for {n_s1} S1 records...")
-        q_parts = []
-        for i in range(0, n_s1, pool_slice):
-            X = vec.transform(s1_texts[i:i + pool_slice]).multiply(idf).tocsr()
-            q_parts.append(normalize(X, norm='l2', copy=False))
+        # Pass 2: normalized TF-IDF for S1, in chunks ON DISK - Q never lives
+        # whole in RAM no matter how big source1 is.
+        scratch = "/kaggle/working" if os.path.exists("/kaggle/working") else "."
+        q_paths = []
+        print(f"  Pass 2/3: vectorizing {n_s1} S1 records to disk chunks of {s1_batch}...")
+        for ci, i in enumerate(range(0, n_s1, s1_batch)):
+            X = vec.transform(slice_texts(df_s1, i, min(i + s1_batch, n_s1)))
+            X = normalize(X.multiply(idf).tocsr(), norm='l2', copy=False)
+            p = os.path.join(scratch, f"_l2_qchunk_{ci}.npz")
+            sp.save_npz(p, X)
+            q_paths.append(p)
             del X
-        Q = sp.vstack(q_parts, format='csr') if len(q_parts) > 1 else q_parts[0]
-        del q_parts, s1_texts
-        gc.collect()
+            gc.collect()
 
-        # Pass 2: match pool slice by slice; full pool matrix never exists.
-        print(f"  Pass 2/2: matching {n_pool} pool records in {pool_slice}-row slices...")
+        # Pass 3: match pool slice by slice; only >=threshold pairs ever
+        # become Python objects.
+        print(f"  Pass 3/3: matching {n_pool} pool records in {pool_slice}-row slices...")
         hits = {}  # s1_idx -> {pool_idx: best score}
         n_slices = (n_pool + pool_slice - 1) // pool_slice
         for p_start in range(0, n_pool, pool_slice):
             p_end = min(p_start + pool_slice, n_pool)
             print(f"  Pool slice [{p_start}:{p_end}] ({p_start // pool_slice + 1}/{n_slices})...")
             Ps = normalize(
-                vec.transform(pool_texts[p_start:p_end]).multiply(idf).tocsr(),
+                vec.transform(slice_texts(df_pool, p_start, p_end)).multiply(idf).tocsr(),
                 norm='l2', copy=False)
-            for s_start in range(0, Q.shape[0], s1_batch):
-                S = (Q[s_start:s_start + s1_batch] @ Ps.T).tocsr()
-                # Zero out sub-threshold entries and compact BEFORE converting
-                # to COO - with millions of pairs, materializing every nonzero
-                # (including hash-collision noise) is what OOMs the box.
+            for ci, qp in enumerate(q_paths):
+                Qc = sp.load_npz(qp)
+                S = (Qc @ Ps.T).tocsr()
                 S.data[S.data < sim_threshold] = 0.0
-                S.eliminate_zeros()
+                S.eliminate_zeros()  # compact BEFORE materializing as COO
                 S = S.tocoo()
+                base = ci * s1_batch
                 for i, j, v in zip(S.row, S.col, S.data):
-                    gi, gj = s_start + int(i), p_start + int(j)
+                    gi, gj = base + int(i), p_start + int(j)
                     row = hits.get(gi)
                     if row is None:
                         hits[gi] = {gj: float(v)}
                     elif v > row.get(gj, -1.0):
                         row[gj] = float(v)
-                del S
+                del Qc, S
             del Ps
             gc.collect()
             # Bound accumulation: prune any row past 2x top_k.
@@ -155,7 +164,9 @@ class LayeredBlocker:
                 if len(row) > top_k * 2:
                     hits[k] = dict(sorted(row.items(), key=lambda t: -t[1])[:top_k])
 
-        del Q, pool_texts
+        for qp in q_paths:
+            os.remove(qp)
+        del q_paths
         gc.collect()
 
         n_added = 0
@@ -224,7 +235,8 @@ class LayeredBlocker:
             print(f"Skipping Layer 3: {e}")
             return
 
-        df_pool = pd.concat([df_s2, df_s3]).reset_index(drop=True)
+        df_pool = pd.concat([df_s2[['entity_id', 'embed_text']],
+                             df_s3[['entity_id', 'embed_text']]]).reset_index(drop=True)
         # FIXED: embed the raw-preserved text (scripts/accents intact), not the
         # ASCII-stripped clean text - the multilingual model needs multilingual input.
         pool_texts = df_pool['embed_text'].tolist()
@@ -355,7 +367,8 @@ class LayeredBlocker:
 
     def layer4_address_only(self, df_s1, df_s2, df_s3):
         print("Running Layer 4: Address-Only Fallback...")
-        df_pool = pd.concat([df_s2, df_s3])
+        df_pool = pd.concat([df_s2[['entity_id', 'clean_address']],
+                             df_s3[['entity_id', 'clean_address']]])
         pool_valid = df_pool[(df_pool['clean_address'] != "") & (df_pool['clean_address'].str.len() > 5)]
         s1_valid = df_s1[(df_s1['clean_address'] != "") & (df_s1['clean_address'].str.len() > 5)]
 
@@ -381,7 +394,8 @@ class LayeredBlocker:
         def tokset(s):
             return set(str(s).split()) if s else set()
 
-        pool = pd.concat([df_s2, df_s3])
+        pool = pd.concat([df_s2[['entity_id', 'extracted_pin', 'street_tokens']],
+                          df_s3[['entity_id', 'extracted_pin', 'street_tokens']]])
         pool_by_pin = {}
         for pin, grp in pool[pool['extracted_pin'] != ""].groupby('extracted_pin'):
             pool_by_pin[pin] = [(r['entity_id'], tokset(r['street_tokens']))
@@ -411,7 +425,8 @@ class LayeredBlocker:
         sometimes tuck these into the address string; a shared 7+ digit
         number is a very strong candidate signal."""
         print("Running Layer 5: Phone/ID Key Blocking...")
-        pool = pd.concat([df_s2, df_s3])
+        pool = pd.concat([df_s2[['entity_id', 'phone_keys']],
+                          df_s3[['entity_id', 'phone_keys']]])
 
         def explode(df):
             rows = []
