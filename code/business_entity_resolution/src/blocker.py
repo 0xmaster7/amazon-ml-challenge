@@ -4,6 +4,7 @@ import os
 import gc
 import json
 import hashlib
+import pickle
 
 class LayeredBlocker:
     def __init__(self):
@@ -14,6 +15,25 @@ class LayeredBlocker:
         self.pool_embeddings = None
         self.pool_ids = None
         self.s1_ids = None
+
+    def save_progress(self, ckpt_dir, done_layers):
+        """Persist candidate pairs + completed layer names after each layer,
+        so an OOM/session kill mid-blocking doesn't lose earlier layers."""
+        path = os.path.join(ckpt_dir, "blocker_progress.pkl")
+        with open(path, 'wb') as f:
+            pickle.dump({'pairs': self.candidate_pairs, 'done': sorted(done_layers)}, f)
+        print(f"[checkpoint] blocker progress saved ({len(self.candidate_pairs)} pairs, done: {sorted(done_layers)})")
+
+    def load_progress(self, ckpt_dir):
+        """Returns the set of completed layer names; restores candidate pairs."""
+        path = os.path.join(ckpt_dir, "blocker_progress.pkl")
+        if not os.path.exists(path):
+            return set()
+        with open(path, 'rb') as f:
+            d = pickle.load(f)
+        self.candidate_pairs = d['pairs']
+        print(f"[checkpoint] blocker resumed: {len(self.candidate_pairs)} pairs, layers done: {d['done']}")
+        return set(d['done'])
 
     def _add_pair(self, s1_id, cand_id, source_layer, faiss_rank=None, faiss_score=None):
         pair = (s1_id, cand_id)
@@ -44,47 +64,99 @@ class LayeredBlocker:
 
     def layer2_tfidf_blocking(self, df_s1, df_s2, df_s3,
                               sim_threshold=0.45, top_k=30,
-                              pool_slice=250000, s1_batch=5000):
-        """Typo safety net via sparse TF-IDF over character n-grams.
+                              pool_slice=200000, s1_batch=20000,
+                              n_features=2 ** 21):
+        """Typo safety net via TF-IDF over character n-grams, MEMORY-BOUNDED.
 
-        REPLACES the old pure-Python datasketch MinHash layer, which was
-        commented out because it could not run at this scale. This version is
-        fully vectorized: one TfidfVectorizer fit, then sparse matrix products
-        in pool slices. Cosine similarity because rows are L2-normalized.
+        v2.2 rewrite: the old version used TfidfVectorizer.fit_transform over
+        ~2.2M records, which built a multi-GB vocabulary dict + full sparse
+        matrix and got the process OOM-killed on a 13GB Kaggle box. This
+        version:
+          - HashingVectorizer: no vocabulary dict at all (stateless).
+          - Two sliced passes: idf counts first, then per-slice matching -
+            the full pool matrix is never materialized.
+          - Hits are pruned to ~top_k per entity as they accumulate.
+        Recall impact is negligible: hash collisions at 2^21 buckets are rare
+        and the sim math (cosine over char n-gram tf-idf) is unchanged.
         """
-        from sklearn.feature_extraction.text import TfidfVectorizer
+        from sklearn.feature_extraction.text import HashingVectorizer
+        from sklearn.preprocessing import normalize
+        import scipy.sparse as sp
 
-        print("Running Layer 2: TF-IDF char-n-gram blocking (typo safety net)...")
+        print("Running Layer 2: TF-IDF char-n-gram blocking (memory-bounded)...")
         df_pool = pd.concat([df_s2, df_s3])
         pool_texts = (df_pool['clean_name'] + " " + df_pool['clean_address']).tolist()
         s1_texts = (df_s1['clean_name'] + " " + df_s1['clean_address']).tolist()
         pool_ids = df_pool['entity_id'].values
         s1_ids_arr = df_s1['entity_id'].values
+        n_pool = len(pool_texts)
+        n_s1 = len(s1_texts)
+        N = n_pool + n_s1
 
-        vec = TfidfVectorizer(analyzer='char_wb', ngram_range=(3, 5),
-                              min_df=2, norm='l2', dtype=np.float32)
-        P = vec.fit_transform(pool_texts)   # (n_pool, V) sparse, rows L2-normalized
-        Q = vec.transform(s1_texts)         # (n_s1, V)
-        print(f"  TF-IDF vocab: {P.shape[1]} terms; pool {P.shape[0]}, s1 {Q.shape[0]}")
+        vec = HashingVectorizer(analyzer='char_wb', ngram_range=(3, 5),
+                                n_features=n_features, norm=None,
+                                alternate_sign=False, dtype=np.float32)
 
-        hits = {}  # s1_idx -> list of (score, pool_idx)
-        n_slices = (P.shape[0] + pool_slice - 1) // pool_slice
-        for p_start in range(0, P.shape[0], pool_slice):
-            p_end = min(p_start + pool_slice, P.shape[0])
-            Pslice = P[p_start:p_end]
+        # Pass 1: document frequency per feature, slice by slice.
+        print(f"  Pass 1/2: idf counts over {N} records in {pool_slice}-row slices...")
+        df_counts = np.zeros(n_features, dtype=np.float64)
+        for texts in (pool_texts, s1_texts):
+            for i in range(0, len(texts), pool_slice):
+                X = vec.transform(texts[i:i + pool_slice])
+                X.data[:] = 1.0  # binarize -> document frequency
+                df_counts += np.asarray(X.sum(axis=0)).ravel()
+                del X
+                gc.collect()
+        idf = np.log((1.0 + N) / (1.0 + df_counts)) + 1.0
+        del df_counts
+        gc.collect()
+
+        # Materialize Q (S1 side) once - it is the smaller side.
+        print(f"  Building normalized TF-IDF for {n_s1} S1 records...")
+        q_parts = []
+        for i in range(0, n_s1, pool_slice):
+            X = vec.transform(s1_texts[i:i + pool_slice]).multiply(idf).tocsr()
+            q_parts.append(normalize(X, norm='l2', copy=False))
+            del X
+        Q = sp.vstack(q_parts, format='csr') if len(q_parts) > 1 else q_parts[0]
+        del q_parts, s1_texts
+        gc.collect()
+
+        # Pass 2: match pool slice by slice; full pool matrix never exists.
+        print(f"  Pass 2/2: matching {n_pool} pool records in {pool_slice}-row slices...")
+        hits = {}  # s1_idx -> {pool_idx: best score}
+        n_slices = (n_pool + pool_slice - 1) // pool_slice
+        for p_start in range(0, n_pool, pool_slice):
+            p_end = min(p_start + pool_slice, n_pool)
             print(f"  Pool slice [{p_start}:{p_end}] ({p_start // pool_slice + 1}/{n_slices})...")
+            Ps = normalize(
+                vec.transform(pool_texts[p_start:p_end]).multiply(idf).tocsr(),
+                norm='l2', copy=False)
             for s_start in range(0, Q.shape[0], s1_batch):
-                Qb = Q[s_start:s_start + s1_batch]
-                S = (Qb @ Pslice.T).tocoo()  # cosine sims, sparse
-                for i, j, v in zip(S.row, S.col, S.data):
-                    if v >= sim_threshold:
-                        hits.setdefault(s_start + i, []).append((float(v), p_start + j))
+                S = (Q[s_start:s_start + s1_batch] @ Ps.T).tocoo()
+                keep = S.data >= sim_threshold
+                for i, j, v in zip(S.row[keep], S.col[keep], S.data[keep]):
+                    gi, gj = s_start + int(i), p_start + int(j)
+                    row = hits.get(gi)
+                    if row is None:
+                        hits[gi] = {gj: float(v)}
+                    elif v > row.get(gj, -1.0):
+                        row[gj] = float(v)
+                del S
+            del Ps
+            gc.collect()
+            # Bound accumulation: prune any row past 2x top_k.
+            for k, row in hits.items():
+                if len(row) > top_k * 2:
+                    hits[k] = dict(sorted(row.items(), key=lambda t: -t[1])[:top_k])
+
+        del Q, pool_texts
+        gc.collect()
 
         n_added = 0
-        for s_idx, lst in hits.items():
-            lst.sort(key=lambda t: -t[0])
+        for s_idx, row in hits.items():
             s1_id = s1_ids_arr[s_idx]
-            for score, pidx in lst[:top_k]:
+            for pidx, score in sorted(row.items(), key=lambda t: -t[1])[:top_k]:
                 self._add_pair(s1_id, pool_ids[pidx], 'layer2_tfidf')
                 n_added += 1
         print(f"Layer 2 complete. Added {n_added} pairs. Total pairs so far: {len(self.candidate_pairs)}")

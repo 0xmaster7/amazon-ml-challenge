@@ -223,14 +223,30 @@ def main():
     df_pairs = load_ckpt(ckpt_dir, "pairs_train.pkl") if args.resume else None
     if df_pairs is None:
         blocker_keep = LayeredBlocker()
-        blocker_keep.layer1_exact_key_blocking(df_s1, df_s2, df_s3)
-        blocker_keep.layer2_tfidf_blocking(df_s1, df_s2, df_s3)
+        # Per-layer checkpointing: each completed layer survives an OOM/kill.
+        done_layers = blocker_keep.load_progress(ckpt_dir) if args.resume else set()
+
+        def run_layer(name, fn):
+            if name in done_layers:
+                print(f"[checkpoint] skipping {name} (already done)")
+                return
+            fn()
+            done_layers.add(name)
+            blocker_keep.save_progress(ckpt_dir, done_layers)
+
+        run_layer('layer1', lambda: blocker_keep.layer1_exact_key_blocking(df_s1, df_s2, df_s3))
+        run_layer('layer2', lambda: blocker_keep.layer2_tfidf_blocking(df_s1, df_s2, df_s3))
+        # Layer 3 ALWAYS runs: its memmap cache skips re-encoding, and the
+        # feature stage needs the embeddings + id maps attached. Pairs it adds
+        # are idempotent, and we save progress right after so a later-layer
+        # kill doesn't lose them.
         blocker_keep.layer3_semantic_embeddings(df_s1, df_s2, df_s3)
         if args.embedder2:
             blocker_keep.layer3_semantic_embeddings(df_s1, df_s2, df_s3, model_name=args.embedder2)
-        blocker_keep.layer4_address_only(df_s1, df_s2, df_s3)
-        blocker_keep.layer4b_near_exact_address(df_s1, df_s2, df_s3)
-        blocker_keep.layer5_phone_key_blocking(df_s1, df_s2, df_s3)
+        blocker_keep.save_progress(ckpt_dir, done_layers)
+        run_layer('layer4', lambda: blocker_keep.layer4_address_only(df_s1, df_s2, df_s3))
+        run_layer('layer4b', lambda: blocker_keep.layer4b_near_exact_address(df_s1, df_s2, df_s3))
+        run_layer('layer5', lambda: blocker_keep.layer5_phone_key_blocking(df_s1, df_s2, df_s3))
         df_pairs = blocker_keep.export_candidate_pairs(os.path.join(args.output_dir, "candidate_pairs.tsv"))
         save_ckpt(ckpt_dir, "pairs_train.pkl", df_pairs)
 

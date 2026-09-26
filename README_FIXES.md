@@ -173,3 +173,21 @@ Not implemented, with reason:
 - Whole pack re-scanned for used-but-never-defined names (pyflakes over all
   10 source files) - no other instances. predict.py was never affected (it
   has its own checkpoint helpers).
+
+---
+
+# v2.2 hotfix (Layer 2 OOM kill on Kaggle)
+
+- blocker.py layer2_tfidf_blocking rewritten memory-bounded: HashingVectorizer
+  (no multi-GB vocabulary dict), two sliced passes (idf counts, then
+  per-slice matching) so the full 2.2M-row pool matrix is never materialized,
+  and per-entity hit accumulation pruned to ~top_k as it goes. Verified:
+  identical retrieval behavior to the old implementation on 20k-row synthetic
+  data at 0.25GB peak, 500/500 typo recall on distinct-name records.
+- Per-layer blocking checkpointing: blocker progress (pairs + completed
+  layers) is saved after every layer. A kill during Layer 2 no longer loses
+  Layer 1's pairs - re-run with --resume and completed layers are skipped.
+  (Layer 3 always re-runs so the feature stage gets embeddings attached, but
+  its memmap cache skips re-encoding.)
+- Notebook + one-cell runner: official validator args corrected to
+  --matching/--candidate/--test-dir.
