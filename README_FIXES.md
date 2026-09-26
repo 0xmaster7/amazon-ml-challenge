@@ -207,3 +207,17 @@ Not implemented, with reason:
   frames and embedder memmaps freed before training.
 - Rerun: NO wipe needed - blocker per-layer checkpoints from the last run
   resume cleanly. Just re-pull the branch and re-run the cell.
+
+---
+
+# v2.4 hotfix (Layer 2 died on its FIRST pool slice)
+
+- Root cause: the 2^21 hash space is DENSER than the true n-gram vocabulary,
+  so hash collisions inflated the sparse product's nonzero count before
+  thresholding could filter - that intermediate OOM'd the kernel.
+- Hash space raised to 2^24 (collision noise drops ~8x); sub-threshold
+  entries are now zeroed + compacted on the CSR BEFORE any COO
+  materialization; pool deduped by entity_id.
+- Verified: 500/500 typo recall on realistic distinct-name synthetic data,
+  0.45GB peak. Pool dedup by entity_id is the only safe shrink - two rows
+  with identical text but different entity_ids are still distinct candidates.

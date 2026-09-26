@@ -65,7 +65,7 @@ class LayeredBlocker:
     def layer2_tfidf_blocking(self, df_s1, df_s2, df_s3,
                               sim_threshold=0.45, top_k=30,
                               pool_slice=100000, s1_batch=10000,
-                              n_features=2 ** 21):
+                              n_features=2 ** 24):
         """Typo safety net via TF-IDF over character n-grams, MEMORY-BOUNDED.
 
         v2.2 rewrite: the old version used TfidfVectorizer.fit_transform over
@@ -76,7 +76,7 @@ class LayeredBlocker:
           - Two sliced passes: idf counts first, then per-slice matching -
             the full pool matrix is never materialized.
           - Hits are pruned to ~top_k per entity as they accumulate.
-        Recall impact is negligible: hash collisions at 2^21 buckets are rare
+        Recall impact is negligible: hash collisions at 2^24 buckets are rare
         and the sim math (cosine over char n-gram tf-idf) is unchanged.
         """
         from sklearn.feature_extraction.text import HashingVectorizer
@@ -84,7 +84,7 @@ class LayeredBlocker:
         import scipy.sparse as sp
 
         print("Running Layer 2: TF-IDF char-n-gram blocking (memory-bounded)...")
-        df_pool = pd.concat([df_s2, df_s3])
+        df_pool = pd.concat([df_s2, df_s3]).drop_duplicates('entity_id')
         pool_texts = (df_pool['clean_name'] + " " + df_pool['clean_address']).tolist()
         s1_texts = (df_s1['clean_name'] + " " + df_s1['clean_address']).tolist()
         pool_ids = df_pool['entity_id'].values
@@ -133,9 +133,14 @@ class LayeredBlocker:
                 vec.transform(pool_texts[p_start:p_end]).multiply(idf).tocsr(),
                 norm='l2', copy=False)
             for s_start in range(0, Q.shape[0], s1_batch):
-                S = (Q[s_start:s_start + s1_batch] @ Ps.T).tocoo()
-                keep = S.data >= sim_threshold
-                for i, j, v in zip(S.row[keep], S.col[keep], S.data[keep]):
+                S = (Q[s_start:s_start + s1_batch] @ Ps.T).tocsr()
+                # Zero out sub-threshold entries and compact BEFORE converting
+                # to COO - with millions of pairs, materializing every nonzero
+                # (including hash-collision noise) is what OOMs the box.
+                S.data[S.data < sim_threshold] = 0.0
+                S.eliminate_zeros()
+                S = S.tocoo()
+                for i, j, v in zip(S.row, S.col, S.data):
                     gi, gj = s_start + int(i), p_start + int(j)
                     row = hits.get(gi)
                     if row is None:
