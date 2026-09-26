@@ -1,9 +1,15 @@
-pandas
-xgboost
-rapidfuzz
-sentence-transformers
-faiss-gpu
-datasketch
-transformers
-accelerate
-bitsandbytes
+# Pinned for reproducibility (required by the final submission package).
+# faiss-cpu works everywhere; if you have a CUDA box you can swap in faiss-gpu,
+# but the pipeline only needs faiss for the CPU fallback path (GPU search uses torch).
+pandas==2.2.2
+numpy==1.26.4
+scikit-learn==1.5.1
+scipy==1.14.1
+xgboost==2.1.1
+rapidfuzz==3.10.0
+sentence-transformers==3.0.1
+faiss-cpu==1.8.0.post1
+torch==2.4.0
+transformers==4.44.2
+accelerate==0.33.0
+bitsandbytes==0.43.3

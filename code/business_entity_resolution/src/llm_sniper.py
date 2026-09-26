@@ -5,7 +5,9 @@ class LLMSniper:
     def __init__(self):
         print("Loading Qwen2.5-7B-Instruct for Arbitration...")
         try:
-            # We load in 4-bit to fit on a Kaggle T4 GPU
+            # 4-bit to fit on a Kaggle T4 GPU. Apache 2.0 license - compliant
+            # with the challenge's MIT/Apache-2.0 model rule. (Llama 3 is NOT:
+            # custom Meta license, would risk disqualification.)
             self.pipe = pipeline(
                 "text-generation",
                 model="Qwen/Qwen2.5-7B-Instruct",
@@ -18,12 +20,15 @@ class LLMSniper:
 
     def arbitrate(self, df_ambiguous):
         """
-        Takes a dataframe of borderline pairs (e.g., XGBoost probability between 0.35 and 0.65)
-        and asks the LLM to make the final Yes/No call.
+        Takes a dataframe of borderline pairs (XGBoost probability bracketing
+        the tuned threshold) and asks the LLM to make the final Yes/No call.
+        Returns a plain list of 0/1 ints aligned with the dataframe rows.
         """
         if self.pipe is None:
             print("LLM not loaded. Falling back to XGBoost scores.")
-            return df_ambiguous['xgb_prob'] > 0.5
+            # FIXED: was returning a pandas Series (index alignment hazard for
+            # the caller); now returns a positional list like the success path.
+            return [1 if p > 0.5 else 0 for p in df_ambiguous['xgb_prob']]
 
         results = []
         for _, row in df_ambiguous.iterrows():
@@ -33,18 +38,18 @@ class LLMSniper:
                 f"Record 2: Name: '{row['name_cand']}', Address: '{row['addr_cand']}'\n\n"
                 "Are they the same business? Answer strictly with YES or NO."
             )
-            
+
             messages = [
                 {"role": "system", "content": "You are a highly precise entity resolution bot."},
                 {"role": "user", "content": prompt}
             ]
-            
+
             out = self.pipe(messages, max_new_tokens=5, temperature=0.0)
             response = out[0]['generated_text'][-1]['content'].strip().upper()
-            
+
             if "YES" in response:
                 results.append(1)
             else:
                 results.append(0)
-                
+
         return results

@@ -1,8 +1,9 @@
 import pandas as pd
 import numpy as np
-from datasketch import MinHash, MinHashLSH
-from sentence_transformers import SentenceTransformer
-import faiss
+import os
+import gc
+import json
+import hashlib
 
 class LayeredBlocker:
     def __init__(self):
@@ -13,7 +14,7 @@ class LayeredBlocker:
         self.pool_embeddings = None
         self.pool_ids = None
         self.s1_ids = None
-        
+
     def _add_pair(self, s1_id, cand_id, source_layer, faiss_rank=None, faiss_score=None):
         pair = (s1_id, cand_id)
         if pair not in self.candidate_pairs:
@@ -24,13 +25,13 @@ class LayeredBlocker:
         if faiss_rank is not None and (meta['faiss_rank'] == -1 or faiss_rank < meta['faiss_rank']):
             meta['faiss_rank'] = faiss_rank
             meta['faiss_score'] = faiss_score
-            
+
     def layer1_exact_key_blocking(self, df_s1, df_s2, df_s3):
         print("Running Layer 1: Exact Key Blocking...")
         df_pool = pd.concat([df_s2, df_s3])
         pool_valid = df_pool[(df_pool['extracted_pin'] != "") & (df_pool['name_first_token'] != "")]
         s1_valid = df_s1[(df_s1['extracted_pin'] != "") & (df_s1['name_first_token'] != "")]
-        
+
         merged = pd.merge(
             s1_valid[['entity_id', 'name_first_token', 'extracted_pin']],
             pool_valid[['entity_id', 'name_first_token', 'extracted_pin']],
@@ -41,37 +42,96 @@ class LayeredBlocker:
             self._add_pair(row['entity_id_s1'], row['entity_id_cand'], 'layer1_exact')
         print(f"Layer 1 complete. Total pairs so far: {len(self.candidate_pairs)}")
 
-    def _get_minhash(self, text):
-        m = MinHash(num_perm=128)
-        for i in range(len(text) - 2):
-            m.update(text[i:i+3].encode('utf8'))
-        return m
+    def layer2_tfidf_blocking(self, df_s1, df_s2, df_s3,
+                              sim_threshold=0.45, top_k=30,
+                              pool_slice=250000, s1_batch=5000):
+        """Typo safety net via sparse TF-IDF over character n-grams.
 
-    def layer2_minhash_lsh(self, df_s1, df_s2, df_s3):
-        print("Running Layer 2: MinHash LSH for typo tolerance...")
-        lsh = MinHashLSH(threshold=0.5, num_perm=128)
+        REPLACES the old pure-Python datasketch MinHash layer, which was
+        commented out because it could not run at this scale. This version is
+        fully vectorized: one TfidfVectorizer fit, then sparse matrix products
+        in pool slices. Cosine similarity because rows are L2-normalized.
+        """
+        from sklearn.feature_extraction.text import TfidfVectorizer
+
+        print("Running Layer 2: TF-IDF char-n-gram blocking (typo safety net)...")
         df_pool = pd.concat([df_s2, df_s3])
-        df_pool['combined_text'] = df_pool['clean_name'] + " " + df_pool['clean_address']
-        df_s1['combined_text'] = df_s1['clean_name'] + " " + df_s1['clean_address']
-        
-        inserted = set()
-        for _, row in df_pool.iterrows():
-            if len(row['combined_text']) > 3 and row['entity_id'] not in inserted:
-                try:
-                    lsh.insert(row['entity_id'], self._get_minhash(row['combined_text']))
-                    inserted.add(row['entity_id'])
-                except ValueError:
-                    pass  # duplicate key
-                
-        for _, row in df_s1.iterrows():
-            if len(row['combined_text']) > 3:
-                m_query = self._get_minhash(row['combined_text'])
-                for cand_id in lsh.query(m_query):
-                    self._add_pair(row['entity_id'], cand_id, 'layer2_minhash')
-        print(f"Layer 2 complete. Total pairs so far: {len(self.candidate_pairs)}")
+        pool_texts = (df_pool['clean_name'] + " " + df_pool['clean_address']).tolist()
+        s1_texts = (df_s1['clean_name'] + " " + df_s1['clean_address']).tolist()
+        pool_ids = df_pool['entity_id'].values
+        s1_ids_arr = df_s1['entity_id'].values
+
+        vec = TfidfVectorizer(analyzer='char_wb', ngram_range=(3, 5),
+                              min_df=2, norm='l2', dtype=np.float32)
+        P = vec.fit_transform(pool_texts)   # (n_pool, V) sparse, rows L2-normalized
+        Q = vec.transform(s1_texts)         # (n_s1, V)
+        print(f"  TF-IDF vocab: {P.shape[1]} terms; pool {P.shape[0]}, s1 {Q.shape[0]}")
+
+        hits = {}  # s1_idx -> list of (score, pool_idx)
+        n_slices = (P.shape[0] + pool_slice - 1) // pool_slice
+        for p_start in range(0, P.shape[0], pool_slice):
+            p_end = min(p_start + pool_slice, P.shape[0])
+            Pslice = P[p_start:p_end]
+            print(f"  Pool slice [{p_start}:{p_end}] ({p_start // pool_slice + 1}/{n_slices})...")
+            for s_start in range(0, Q.shape[0], s1_batch):
+                Qb = Q[s_start:s_start + s1_batch]
+                S = (Qb @ Pslice.T).tocoo()  # cosine sims, sparse
+                for i, j, v in zip(S.row, S.col, S.data):
+                    if v >= sim_threshold:
+                        hits.setdefault(s_start + i, []).append((float(v), p_start + j))
+
+        n_added = 0
+        for s_idx, lst in hits.items():
+            lst.sort(key=lambda t: -t[0])
+            s1_id = s1_ids_arr[s_idx]
+            for score, pidx in lst[:top_k]:
+                self._add_pair(s1_id, pool_ids[pidx], 'layer2_tfidf')
+                n_added += 1
+        print(f"Layer 2 complete. Added {n_added} pairs. Total pairs so far: {len(self.candidate_pairs)}")
+
+    def _embed_cache_key(self, model_name, ids, texts):
+        """Content-derived cache key for the memmap embedding cache.
+
+        FIXED: the old cache was validated only by byte size, so same-row-count
+        but different data (train vs test, or any cleaning change) silently
+        reused the WRONG embeddings. This key covers model, row count, a text
+        sample, and total character count.
+        """
+        h = hashlib.md5()
+        h.update(model_name.encode())
+        h.update(str(len(texts)).encode())
+        n = len(texts)
+        sample_idx = list(range(min(1000, n))) + list(range(max(0, n - 1000), n))
+        for i in sample_idx:
+            h.update(str(ids[i]).encode())
+            h.update(b'\x00')
+            h.update(texts[i].encode('utf-8', errors='ignore'))
+            h.update(b'\x00')
+        h.update(str(sum(len(t) for t in texts)).encode())
+        return h.hexdigest()
+
+    def _encode_to_memmap(self, model, texts, mmap_path, d, chunk_size=500000):
+        print(f"Encoding {len(texts)} texts in chunks with memmap -> {mmap_path}...")
+        if os.path.exists(mmap_path):
+            os.remove(mmap_path)
+        emb_mm = np.memmap(mmap_path, dtype='float32', mode='w+', shape=(len(texts), d))
+        for i in range(0, len(texts), chunk_size):
+            chunk = texts[i:i + chunk_size]
+            print(f"  Encoding chunk {i} to {i + len(chunk)}...")
+            emb_chunk = model.encode(chunk, show_progress_bar=True,
+                                     normalize_embeddings=True, batch_size=1024)
+            emb_mm[i:i + len(chunk)] = emb_chunk
+            emb_mm.flush()
+            del emb_chunk, chunk
+            gc.collect()
+        del emb_mm
+        gc.collect()
 
     def layer3_semantic_embeddings(self, df_s1, df_s2, df_s3, model_name=None):
-        import os, gc, torch
+        # Lazy imports so layers 1/2/4 run without the heavy ML stack installed
+        import torch
+        import faiss
+        from sentence_transformers import SentenceTransformer
         if model_name is None:
             if os.path.exists("../../output/finetuned_embedder"):
                 model_name = "../../output/finetuned_embedder"
@@ -88,108 +148,95 @@ class LayeredBlocker:
             return
 
         df_pool = pd.concat([df_s2, df_s3]).reset_index(drop=True)
-        pool_texts = (df_pool['clean_name'] + " " + df_pool['clean_address']).tolist()
-        s1_texts = (df_s1['clean_name'] + " " + df_s1['clean_address']).tolist()
-        
-        # Dimensions for paraphrase-multilingual-MiniLM-L12-v2 is 384
-        d = 384
-        
-        # Store in /kaggle/working so rm -rf amazon-ml-challenge will NEVER delete the embeddings
+        # FIXED: embed the raw-preserved text (scripts/accents intact), not the
+        # ASCII-stripped clean text - the multilingual model needs multilingual input.
+        pool_texts = df_pool['embed_text'].tolist()
+        s1_texts = df_s1['embed_text'].tolist()
+        pool_ids = df_pool['entity_id'].values
+        s1_ids = df_s1['entity_id'].values
+
+        d = model.get_sentence_embedding_dimension()
+
+        import re as _re
         mmap_dir = "/kaggle/working" if os.path.exists("/kaggle/working") else "."
-        pool_mmap_path = os.path.join(mmap_dir, "pool_embeddings.dat")
-        s1_mmap_path = os.path.join(mmap_dir, "s1_embeddings.dat")
+        # Cache files are per-model: a second embedder (ensemble) or a
+        # fine-tuned checkpoint gets its own memmaps instead of clobbering.
+        model_slug = _re.sub(r'[^A-Za-z0-9]+', '_', model_name)[-50:]
+        pool_mmap_path = os.path.join(mmap_dir, f"pool_embeddings_{model_slug}.dat")
+        s1_mmap_path = os.path.join(mmap_dir, f"s1_embeddings_{model_slug}.dat")
 
-        # Check if pool embeddings already exist on disk from previous run
-        expected_pool_bytes = len(pool_texts) * d * 4
-        if os.path.exists(pool_mmap_path) and os.path.getsize(pool_mmap_path) == expected_pool_bytes:
-            print(f"Found existing {pool_mmap_path} ({os.path.getsize(pool_mmap_path) / 1e9:.2f} GB). Skipping pool encoding!")
-        else:
-            print("Encoding pool in chunks with memmap...")
-            if os.path.exists(pool_mmap_path): os.remove(pool_mmap_path)
-            pool_embeddings = np.memmap(pool_mmap_path, dtype='float32', mode='w+', shape=(len(pool_texts), d))
-            
-            chunk_size = 500000
-            for i in range(0, len(pool_texts), chunk_size):
-                chunk = pool_texts[i:i+chunk_size]
-                print(f"  Encoding pool chunk {i} to {i+len(chunk)}...")
-                emb_chunk = model.encode(chunk, show_progress_bar=True, normalize_embeddings=True, batch_size=1024)
-                pool_embeddings[i:i+len(chunk)] = emb_chunk
-                pool_embeddings.flush()
-                del emb_chunk, chunk
-                gc.collect()
-            del pool_embeddings
-            gc.collect()
+        # Content-keyed cache validation (see _embed_cache_key)
+        for mmap_path, ids, texts, tag in (
+            (pool_mmap_path, pool_ids, pool_texts, "pool"),
+            (s1_mmap_path, s1_ids, s1_texts, "s1"),
+        ):
+            key = self._embed_cache_key(model_name, ids, texts)
+            key_path = mmap_path + ".key"
+            expected_bytes = len(texts) * d * 4
+            cache_ok = (
+                os.path.exists(mmap_path)
+                and os.path.getsize(mmap_path) == expected_bytes
+                and os.path.exists(key_path)
+                and open(key_path).read().strip() == key
+            )
+            if cache_ok:
+                print(f"Found VALID cached {mmap_path}. Skipping {tag} encoding!")
+            else:
+                if os.path.exists(mmap_path):
+                    print(f"Cache key mismatch for {tag} embeddings - re-encoding (stale cache discarded).")
+                self._encode_to_memmap(model, texts, mmap_path, d)
+                with open(key_path, "w") as f:
+                    f.write(key)
 
-        # Check if S1 embeddings already exist on disk from previous run
-        expected_s1_bytes = len(s1_texts) * d * 4
-        if os.path.exists(s1_mmap_path) and os.path.getsize(s1_mmap_path) == expected_s1_bytes:
-            print(f"Found existing {s1_mmap_path} ({os.path.getsize(s1_mmap_path) / 1e9:.2f} GB). Skipping S1 encoding!")
-        else:
-            print("Encoding S1 in chunks with memmap...")
-            if os.path.exists(s1_mmap_path): os.remove(s1_mmap_path)
-            s1_embeddings = np.memmap(s1_mmap_path, dtype='float32', mode='w+', shape=(len(s1_texts), d))
-            
-            chunk_size = 500000
-            for i in range(0, len(s1_texts), chunk_size):
-                chunk = s1_texts[i:i+chunk_size]
-                print(f"  Encoding S1 chunk {i} to {i+len(chunk)}...")
-                emb_chunk = model.encode(chunk, show_progress_bar=True, normalize_embeddings=True, batch_size=1024)
-                s1_embeddings[i:i+len(chunk)] = emb_chunk
-                s1_embeddings.flush()
-                del emb_chunk, chunk
-                gc.collect()
-            del s1_embeddings
-            gc.collect()
-
-        self.pool_ids = df_pool['entity_id'].values
-        self.s1_ids = df_s1['entity_id'].values
+        self.pool_ids = pool_ids
+        self.s1_ids = s1_ids
         n_pool = len(self.pool_ids)
         n_s1 = len(self.s1_ids)
 
-        # Free heavy Python objects to maximize RAM before FAISS
         del pool_texts, s1_texts, df_pool
         gc.collect()
 
-        # Store memmap for reuse as XGBoost feature
         self.pool_embeddings = np.memmap(pool_mmap_path, dtype='float32', mode='r', shape=(n_pool, d))
         self.s1_embeddings = np.memmap(s1_mmap_path, dtype='float32', mode='r', shape=(n_s1, d))
         self.pool_id_to_idx = {pid: i for i, pid in enumerate(self.pool_ids)}
         self.s1_id_to_idx = {sid: i for i, sid in enumerate(self.s1_ids)}
 
-        # Search embeddings with GPU Tensor Cores if available, else FAISS CPU
-        top_k = 20
-        sim_threshold = 0.55
+        # RECALL TUNING: candidate_pairs.tsv is not scored, so over-generation
+        # is nearly free - the metric cost of a missed match (recall ceiling)
+        # far exceeds Stage 2's filtering cost. top_k raised 20 -> 30,
+        # threshold lowered 0.55 -> 0.50.
+        top_k = 30
+        sim_threshold = 0.50
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         print(f"Searching embeddings with accelerator: {device}...")
 
         if device.type == 'cuda':
-            # Ultra-fast GPU Tensor Core search: ~3-4 minutes for 2.2M x 10.3M!
-            pool_slice_size = 1000000  # 1M vectors per slice (~768 MB in float16)
-            s1_batch_size = 2500       # 2500 queries per batch (~5 GB peak VRAM during matmul)
+            pool_slice_size = 1000000
+            s1_batch_size = 2500
             n_pool_slices = (n_pool + pool_slice_size - 1) // pool_slice_size
 
             for p_idx in range(n_pool_slices):
                 p_start = p_idx * pool_slice_size
                 p_end = min(p_start + pool_slice_size, n_pool)
                 slice_len = p_end - p_start
-                print(f"  GPU Search: Pool slice {p_idx+1}/{n_pool_slices} [{p_start}:{p_end}] ({slice_len} vectors)...")
-                
+                print(f"  GPU Search: Pool slice {p_idx+1}/{n_pool_slices} [{p_start}:{p_end}]...")
+
                 pool_tensor = torch.from_numpy(self.pool_embeddings[p_start:p_end]).to(device=device, dtype=torch.float16)
 
                 n_batches = (n_s1 + s1_batch_size - 1) // s1_batch_size
                 for b_idx in range(n_batches):
                     s_start = b_idx * s1_batch_size
                     s_end = min(s_start + s1_batch_size, n_s1)
-                    
+
                     q_tensor = torch.from_numpy(self.s1_embeddings[s_start:s_end]).to(device=device, dtype=torch.float16)
                     sim_matrix = torch.matmul(q_tensor, pool_tensor.T)
-                    
+
                     actual_k = min(top_k, slice_len)
                     scores, indices = torch.topk(sim_matrix, k=actual_k, dim=1)
-                    
+
                     scores_np = scores.cpu().numpy()
                     indices_np = indices.cpu().numpy()
-                    
+
                     s1_batch_ids = self.s1_ids[s_start:s_end]
                     for q_i, s1_id in enumerate(s1_batch_ids):
                         for rank in range(actual_k):
@@ -198,14 +245,13 @@ class LayeredBlocker:
                                 match_idx = int(indices_np[q_i, rank])
                                 cand_id = self.pool_ids[p_start + match_idx]
                                 self._add_pair(s1_id, cand_id, 'layer3_faiss', faiss_rank=rank, faiss_score=score)
-                                
+
                     del q_tensor, sim_matrix, scores, indices
-                    
+
                 del pool_tensor
                 torch.cuda.empty_cache()
                 print(f"    Slice {p_idx+1}/{n_pool_slices} complete. Total candidate pairs: {len(self.candidate_pairs)}")
         else:
-            # CPU Fallback using FAISS
             print("  Falling back to FAISS CPU...")
             pool_slice_size = 2500000
             s1_search_batch = 50000
@@ -235,7 +281,7 @@ class LayeredBlocker:
         df_pool = pd.concat([df_s2, df_s3])
         pool_valid = df_pool[(df_pool['clean_address'] != "") & (df_pool['clean_address'].str.len() > 5)]
         s1_valid = df_s1[(df_s1['clean_address'] != "") & (df_s1['clean_address'].str.len() > 5)]
-        
+
         merged = pd.merge(
             s1_valid[['entity_id', 'clean_address']],
             pool_valid[['entity_id', 'clean_address']],
@@ -245,6 +291,69 @@ class LayeredBlocker:
         for _, row in merged.iterrows():
             self._add_pair(row['entity_id_s1'], row['entity_id_cand'], 'layer4_address')
         print(f"Layer 4 complete. Total pairs so far: {len(self.candidate_pairs)}")
+
+    def layer4b_near_exact_address(self, df_s1, df_s2, df_s3, jaccard_threshold=0.85,
+                                   max_block=2000):
+        """Near-exact address matching: within each shared pincode block,
+        token-Jaccard on street tokens. Catches single-token address typos
+        that exact-equality Layer 4 misses (strategy doc: exact/NEAR-exact).
+        Blocks bigger than max_block rows on either side are skipped (a pincode
+        that common is a city, not a block)."""
+        print("Running Layer 4b: Near-Exact Address (token-Jaccard within pincode blocks)...")
+
+        def tokset(s):
+            return set(str(s).split()) if s else set()
+
+        pool = pd.concat([df_s2, df_s3])
+        pool_by_pin = {}
+        for pin, grp in pool[pool['extracted_pin'] != ""].groupby('extracted_pin'):
+            pool_by_pin[pin] = [(r['entity_id'], tokset(r['street_tokens']))
+                                for _, r in grp.iterrows()]
+
+        n_added = 0
+        for pin, grp in df_s1[df_s1['extracted_pin'] != ""].groupby('extracted_pin'):
+            cands = pool_by_pin.get(pin)
+            if not cands or len(cands) > max_block or len(grp) > max_block:
+                continue
+            for _, r in grp.iterrows():
+                t1 = tokset(r['street_tokens'])
+                if not t1:
+                    continue
+                for cid, t2 in cands:
+                    if not t2:
+                        continue
+                    inter = len(t1 & t2)
+                    if inter and inter / len(t1 | t2) >= jaccard_threshold:
+                        self._add_pair(r['entity_id'], cid, 'layer4b_near_address')
+                        n_added += 1
+        print(f"Layer 4b complete. Added {n_added} pairs. Total pairs so far: {len(self.candidate_pairs)}")
+
+    def layer5_phone_key_blocking(self, df_s1, df_s2, df_s3):
+        """Blocks on shared long digit runs (phone / tax-ID / registration
+        numbers embedded in the record text). Strategy doc: Indian records
+        sometimes tuck these into the address string; a shared 7+ digit
+        number is a very strong candidate signal."""
+        print("Running Layer 5: Phone/ID Key Blocking...")
+        pool = pd.concat([df_s2, df_s3])
+
+        def explode(df):
+            rows = []
+            for _, r in df.iterrows():
+                for k in (r['phone_keys'] or []):
+                    rows.append((k, r['entity_id']))
+            return rows
+
+        pool_idx = {}
+        for k, eid in explode(pool):
+            pool_idx.setdefault(k, []).append(eid)
+
+        n_added = 0
+        for _, r in df_s1.iterrows():
+            for k in (r['phone_keys'] or []):
+                for cid in pool_idx.get(k, []):
+                    self._add_pair(r['entity_id'], cid, 'layer5_phonekey')
+                    n_added += 1
+        print(f"Layer 5 complete. Added {n_added} pairs. Total pairs so far: {len(self.candidate_pairs)}")
 
     def get_embedding_cosine_sim(self, s1_id, cand_id):
         """Returns the precomputed cosine similarity between an S1 and candidate embedding."""
@@ -267,21 +376,23 @@ class LayeredBlocker:
                 'source1_entity_id': s1,
                 'candidate_entity_id': cand,
                 'found_in_layer1': 1 if 'layer1_exact' in meta['layers'] else 0,
-                'found_in_layer2': 1 if 'layer2_minhash' in meta['layers'] else 0,
+                'found_in_layer2': 1 if 'layer2_tfidf' in meta['layers'] else 0,
                 'found_in_layer3': 1 if 'layer3_faiss' in meta['layers'] else 0,
                 'found_in_layer4': 1 if 'layer4_address' in meta['layers'] else 0,
+                'found_in_layer4b': 1 if 'layer4b_near_address' in meta['layers'] else 0,
+                'found_in_layer5': 1 if 'layer5_phonekey' in meta['layers'] else 0,
                 'total_layers_caught': len(meta['layers']),
                 'faiss_rank': meta['faiss_rank'],
                 'faiss_score': meta['faiss_score'],
             })
-            
+
         df_pairs = pd.DataFrame(records)
         if df_pairs.empty:
             df_pairs = pd.DataFrame(columns=['source1_entity_id', 'candidate_entity_id'])
-            
+
         # Standard TSV export for leaderboard
         grouped = df_pairs.groupby('source1_entity_id')['candidate_entity_id'].apply(lambda x: ','.join(x)).reset_index()
         grouped.rename(columns={'candidate_entity_id': 'candidate_entity_ids'}, inplace=True)
         grouped.to_csv(output_path, sep='\t', index=False)
-        
+
         return df_pairs
