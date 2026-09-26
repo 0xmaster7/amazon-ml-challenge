@@ -63,7 +63,7 @@ def street_token_overlap(street1, street2):
 # MAIN FEATURE BUILDER
 # ============================================================
 
-def build_features_for_pairs(df_pairs, df_s1, df_pool, blocker=None, use_cross_encoder=True):
+def _build_features_chunk(df_pairs, df_s1, df_pool, blocker=None, use_cross_encoder=True, cross_model=None):
     """
     Takes candidate pairs with blocking metadata, merges raw text,
     and computes the FULL feature list for XGBoost.
@@ -219,8 +219,9 @@ def build_features_for_pairs(df_pairs, df_s1, df_pool, blocker=None, use_cross_e
     if use_cross_encoder:
         print(f"  Computing Cross-Encoder scores ({CROSS_ENCODER_MODEL})...")
         try:
-            from sentence_transformers import CrossEncoder
-            cross_model = CrossEncoder(CROSS_ENCODER_MODEL, max_length=128)
+            if cross_model is None:
+                from sentence_transformers import CrossEncoder
+                cross_model = CrossEncoder(CROSS_ENCODER_MODEL, max_length=128)
             pairs = list(zip(
                 (df['clean_name_s1'] + " " + df['clean_address_s1']).tolist(),
                 (df['clean_name_cand'] + " " + df['clean_address_cand']).tolist()
@@ -251,3 +252,37 @@ def build_features_for_pairs(df_pairs, df_s1, df_pool, blocker=None, use_cross_e
 
     print(f"  Feature Engineering Complete. Total features: {len([c for c in df.columns if c not in ['source1_entity_id', 'candidate_entity_id', 'is_true_match']])}")
     return df
+
+
+def build_features_for_pairs(df_pairs, df_s1, df_pool, blocker=None,
+                             use_cross_encoder=True, chunk_size=200000):
+    """Memory-bounded wrapper: features are built in chunks of pairs so the
+    string-heavy merged frame never covers the whole candidate set at once
+    (this was the next OOM after Layer 2 on a 13GB box). The cross-encoder
+    model loads ONCE and is reused across chunks."""
+    import gc
+    n = len(df_pairs)
+    if n <= chunk_size:
+        return _build_features_chunk(df_pairs, df_s1, df_pool, blocker=blocker,
+                                     use_cross_encoder=use_cross_encoder)
+    n_chunks = (n + chunk_size - 1) // chunk_size
+    print(f"Building features in {n_chunks} chunks of {chunk_size} pairs (memory-bounded)...")
+    cross_model = None
+    if use_cross_encoder:
+        from sentence_transformers import CrossEncoder
+        cross_model = CrossEncoder(CROSS_ENCODER_MODEL, max_length=128)
+    parts = []
+    for ci, start in enumerate(range(0, n, chunk_size)):
+        print(f"  Feature chunk {ci + 1}/{n_chunks}...")
+        part = _build_features_chunk(
+            df_pairs.iloc[start:start + chunk_size].copy(), df_s1, df_pool,
+            blocker=blocker, use_cross_encoder=use_cross_encoder,
+            cross_model=cross_model)
+        parts.append(part)
+        del part
+        gc.collect()
+    out = pd.concat(parts, ignore_index=True)
+    del parts
+    gc.collect()
+    print(f"  All chunks done. Total rows: {len(out)}")
+    return out

@@ -3,6 +3,7 @@ import numpy as np
 import os
 import argparse
 import pickle
+import gc
 import xgboost as xgb
 from sklearn.model_selection import StratifiedGroupKFold
 from data_cleaner import process_dataframe
@@ -46,7 +47,7 @@ def train_xgboost(df_features, labels, groups, strata, output_dir, gt, seeds, st
                     and df_features[c].dtype in ['int64', 'float64', 'int32', 'float32', 'bool']]
 
     print(f"Using {len(feature_cols)} features; seeds {seeds}; stratified thresholds: {stratify}")
-    X = df_features[feature_cols]
+    X = df_features[feature_cols].astype(np.float32)
     y = labels.values if hasattr(labels, 'values') else labels
 
     y_true_dict = build_true_dict(gt)
@@ -295,6 +296,11 @@ def main():
         df_features = build_features_for_pairs(df_pairs, df_s1, df_pool, blocker=blocker_keep,
                                                use_cross_encoder=not args.no_cross_encoder)
         save_ckpt(ckpt_dir, "features_train.pkl", df_features)
+    # Free blocking-stage frames and the embedder memmaps before training:
+    # they are unneeded now and cost GBs on a 13GB box.
+    del df_pairs
+    blocker_keep = None
+    gc.collect()
 
     # =================== TRAIN XGBOOST ===================
     strata = df_features['source1_entity_id'].map(

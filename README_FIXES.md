@@ -191,3 +191,19 @@ Not implemented, with reason:
   its memmap cache skips re-encoding.)
 - Notebook + one-cell runner: official validator args corrected to
   --matching/--candidate/--test-dir.
+
+---
+
+# v2.3 hotfix (next OOM: feature stage + leaner defaults)
+
+- feature_engineering.py: features now build in 200k-pair chunks - the
+  string-heavy merged frame no longer covers the whole candidate set at once;
+  cross-encoder model loads once and is reused across chunks. predict.py gets
+  the same bounding automatically (same function).
+- blocker.py Layer 2 defaults lowered (pool_slice 100k, s1_batch 10k);
+  Layer 3 GPU search slices lowered (pool 400k, s1 batch 1000) so the fp16
+  similarity matrix stays ~1GB on the T4.
+- train.py: feature matrix cast to float32 for XGBoost; blocking-stage
+  frames and embedder memmaps freed before training.
+- Rerun: NO wipe needed - blocker per-layer checkpoints from the last run
+  resume cleanly. Just re-pull the branch and re-run the cell.

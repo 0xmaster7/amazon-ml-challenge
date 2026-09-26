@@ -64,7 +64,7 @@ class LayeredBlocker:
 
     def layer2_tfidf_blocking(self, df_s1, df_s2, df_s3,
                               sim_threshold=0.45, top_k=30,
-                              pool_slice=200000, s1_batch=20000,
+                              pool_slice=100000, s1_batch=10000,
                               n_features=2 ** 21):
         """Typo safety net via TF-IDF over character n-grams, MEMORY-BOUNDED.
 
@@ -283,8 +283,8 @@ class LayeredBlocker:
         print(f"Searching embeddings with accelerator: {device}...")
 
         if device.type == 'cuda':
-            pool_slice_size = 1000000
-            s1_batch_size = 2500
+            pool_slice_size = 400000
+            s1_batch_size = 1000
             n_pool_slices = (n_pool + pool_slice_size - 1) // pool_slice_size
 
             for p_idx in range(n_pool_slices):
