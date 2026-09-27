@@ -1,6 +1,5 @@
 import pandas as pd
 import re
-import os
 
 def mem_rss():
     # Current process RSS in GB, no dependencies (reads /proc).

@@ -272,3 +272,32 @@ was still eating most of the 13GB box before any blocking math ran.
   strata/country maps cast to object before fillna.
 - Verified: full pipeline on synthetic data (all 6 layers, chunked features,
   100/100 recall), smoke tests pass, pyflakes clean.
+
+---
+
+# v2.7 disk-backed cleaned data (ZIP delivery, not pushed)
+
+The Kaggle 13 GB host reported 12.0 GB RSS immediately after loading the
+`cleaned_train.pkl` tuple. v2.7 never unpickles this legacy checkpoint. It
+reads raw train/test TSVs in 50,000-row chunks, cleans each chunk with the same
+normalization, writes immutable pandas pickle shards, and builds a compressed
+SQLite lookup of the feature columns. An atomic manifest marks migration done.
+A resumed run uses these shards, not the old full-frame pickle. Conversion is
+one-time and can take significant time and disk space; if interrupted before
+the manifest, it restarts. Keep raw TSVs mounted at the same paths.
+
+Blocking reads only columns for the current layer. Layer 2 retains the same
+TF-IDF hash, IDF, threshold and top-k math, but uses 20k pool slices and 10k
+S1 chunks to reduce its sparse-product peak. Each feature-engineering chunk
+fetches only pair IDs from SQLite; the full feature pool is never loaded.
+Layer 3 still performs full semantic encoding/search and its GPU/CPU working
+set needs live Kaggle telemetry. Existing `blocker_progress.pkl` completed
+layers, `pairs_train.pkl`, `features_train.pkl` and embedding memmap caches
+remain in place. Never delete checkpoints to start this migration. New test
+progress is isolated as `blocker_progress_test.pkl`.
+
+The legacy cleaned pickle is not deleted automatically. It remains on disk
+and is ignored; only delete it manually if disk space is low after confirming
+new shards are complete. This migration does not change the cleaning semantics
+or intentionally change recall, but the full 14.7M-row run has not been
+reproduced locally. The `[mem X.XGB]` logs on Kaggle are authoritative.

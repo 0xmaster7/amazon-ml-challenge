@@ -2,7 +2,6 @@ import pandas as pd
 import numpy as np
 import os
 import gc
-import json
 import hashlib
 import pickle
 from data_cleaner import mem_rss
@@ -17,17 +16,17 @@ class LayeredBlocker:
         self.pool_ids = None
         self.s1_ids = None
 
-    def save_progress(self, ckpt_dir, done_layers):
+    def save_progress(self, ckpt_dir, done_layers, name="blocker_progress.pkl"):
         """Persist candidate pairs + completed layer names after each layer,
         so an OOM/session kill mid-blocking doesn't lose earlier layers."""
-        path = os.path.join(ckpt_dir, "blocker_progress.pkl")
+        path = os.path.join(ckpt_dir, name)
         with open(path, 'wb') as f:
             pickle.dump({'pairs': self.candidate_pairs, 'done': sorted(done_layers)}, f)
         print(f"[checkpoint] blocker progress saved ({len(self.candidate_pairs)} pairs, done: {sorted(done_layers)})")
 
-    def load_progress(self, ckpt_dir):
+    def load_progress(self, ckpt_dir, name="blocker_progress.pkl"):
         """Returns the set of completed layer names; restores candidate pairs."""
-        path = os.path.join(ckpt_dir, "blocker_progress.pkl")
+        path = os.path.join(ckpt_dir, name)
         if not os.path.exists(path):
             return set()
         with open(path, 'rb') as f:
@@ -67,7 +66,7 @@ class LayeredBlocker:
 
     def layer2_tfidf_blocking(self, df_s1, df_s2, df_s3,
                               sim_threshold=0.45, top_k=30,
-                              pool_slice=100000, s1_batch=200000,
+                              pool_slice=20000, s1_batch=10000,
                               n_features=2 ** 24):
         """Typo safety net via TF-IDF over character n-grams, CONSTANT-memory.
 
@@ -180,33 +179,27 @@ class LayeredBlocker:
         print(f"[mem {mem_rss():.1f}GB] Layer 2 complete. Added {n_added} pairs. Total pairs so far: {len(self.candidate_pairs)}")
 
     def _embed_cache_key(self, model_name, ids, texts):
-        """Content-derived cache key for the memmap embedding cache.
-
-        FIXED: the old cache was validated only by byte size, so same-row-count
-        but different data (train vs test, or any cleaning change) silently
-        reused the WRONG embeddings. This key covers model, row count, a text
-        sample, and total character count.
-        """
+        """Stable key across chunk boundaries: model, count, text length and samples."""
         h = hashlib.md5()
         h.update(model_name.encode())
-        h.update(str(len(texts)).encode())
-        n = len(texts)
+        h.update(str(len(ids)).encode())
+        n = len(ids)
         sample_idx = list(range(min(1000, n))) + list(range(max(0, n - 1000), n))
         for i in sample_idx:
             h.update(str(ids[i]).encode())
             h.update(b'\x00')
-            h.update(texts[i].encode('utf-8', errors='ignore'))
+            h.update(str(texts[i]).encode('utf-8', errors='ignore'))
             h.update(b'\x00')
         h.update(str(sum(len(t) for t in texts)).encode())
         return h.hexdigest()
 
-    def _encode_to_memmap(self, model, texts, mmap_path, d, chunk_size=500000):
+    def _encode_to_memmap(self, model, texts, mmap_path, d, chunk_size=25000):
         print(f"Encoding {len(texts)} texts in chunks with memmap -> {mmap_path}...")
         if os.path.exists(mmap_path):
             os.remove(mmap_path)
         emb_mm = np.memmap(mmap_path, dtype='float32', mode='w+', shape=(len(texts), d))
         for i in range(0, len(texts), chunk_size):
-            chunk = texts[i:i + chunk_size]
+            chunk = list(texts[i:i + chunk_size])
             print(f"  Encoding chunk {i} to {i + len(chunk)}...")
             emb_chunk = model.encode(chunk, show_progress_bar=True,
                                      normalize_embeddings=True, batch_size=1024)
@@ -239,10 +232,9 @@ class LayeredBlocker:
 
         df_pool = pd.concat([df_s2[['entity_id', 'embed_text']],
                              df_s3[['entity_id', 'embed_text']]]).reset_index(drop=True)
-        # FIXED: embed the raw-preserved text (scripts/accents intact), not the
-        # ASCII-stripped clean text - the multilingual model needs multilingual input.
-        pool_texts = df_pool['embed_text'].tolist()
-        s1_texts = df_s1['embed_text'].tolist()
+        # Keep the columnar array, not two additional full Python lists.
+        pool_texts = df_pool['embed_text'].values
+        s1_texts = df_s1['embed_text'].values
         pool_ids = df_pool['entity_id'].values
         s1_ids = df_s1['entity_id'].values
 
@@ -446,7 +438,8 @@ class LayeredBlocker:
 
         n_added = 0
         for _, r in df_s1.iterrows():
-            for k in (r['phone_keys'] or []):
+            keys = r['phone_keys']
+            for k in (keys.split() if isinstance(keys, str) else (keys or [])):
                 for cid in pool_idx.get(k, []):
                     self._add_pair(r['entity_id'], cid, 'layer5_phonekey')
                     n_added += 1

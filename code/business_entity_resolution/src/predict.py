@@ -11,7 +11,8 @@ import numpy as np
 import os
 import argparse
 import pickle
-from data_cleaner import process_dataframe, slim_frame, mem_rss
+from data_cleaner import mem_rss
+from streaming_clean import CleanStore
 from blocker import LayeredBlocker
 from feature_engineering import build_features_for_pairs
 from llm_sniper import LLMSniper
@@ -80,22 +81,11 @@ def main():
 
     # =================== LOAD & CLEAN TEST DATA ===================
     print("\n========== LOADING TEST DATA ==========")
-    cleaned = load_ckpt(ckpt_dir, "cleaned_test.pkl") if args.resume else None
-    if cleaned is not None:
-        df_s1, df_s2, df_s3 = cleaned
-    else:
-        df_s1 = process_dataframe(pd.read_csv(os.path.join(args.test_dir, "test_source1.tsv"), sep="\t"))
-        df_s2 = process_dataframe(pd.read_csv(os.path.join(args.test_dir, "test_source2.tsv"), sep="\t"))
-        df_s3 = process_dataframe(pd.read_csv(os.path.join(args.test_dir, "test_source3.tsv"), sep="\t"))
-        save_ckpt(ckpt_dir, "cleaned_test.pkl", (df_s1, df_s2, df_s3))
-    df_s1, df_s2, df_s3 = slim_frame(df_s1), slim_frame(df_s2), slim_frame(df_s3)
-    df_pool = pd.concat([df_s2[['entity_id', 'business_name', 'clean_name', 'expanded_name', 'clean_address', 'raw_address', 'country', 'country_norm', 'extracted_pin', 'house_number', 'street_tokens', 'city_tag', 'state_tag', 'phone_keys']], df_s3[['entity_id', 'business_name', 'clean_name', 'expanded_name', 'clean_address', 'raw_address', 'country', 'country_norm', 'extracted_pin', 'house_number', 'street_tokens', 'city_tag', 'state_tag', 'phone_keys']]]).reset_index(drop=True)
-    print(f"[mem {mem_rss():.1f}GB] cleaned test data loaded/slimmed")
-
-    all_s1_ids = set(df_s1['entity_id'].values)
-    all_pool_ids = set(df_pool['entity_id'].values)
+    store = CleanStore(ckpt_dir, args.test_dir, 'test', args.resume)
+    print(f"[mem {mem_rss():.1f}GB] disk-backed test data ready")
+    all_s1_ids = store.all_ids(1)
+    all_pool_ids = store.all_ids(2) | store.all_ids(3)
     print(f"Test S1 entities: {len(all_s1_ids)} | Test S2+S3 pool: {len(all_pool_ids)}")
-    print(f"Countries in test: {sorted(df_s1['country'].dropna().unique())}")
 
     # =================== BLOCKING ===================
     print("\n========== STAGE 1: LAYERED BLOCKING ==========")
@@ -103,14 +93,26 @@ def main():
     df_pairs = load_ckpt(ckpt_dir, "pairs_test.pkl") if args.resume else None
     if df_pairs is None:
         blocker_keep = LayeredBlocker()
-        blocker_keep.layer1_exact_key_blocking(df_s1, df_s2, df_s3)
-        blocker_keep.layer2_tfidf_blocking(df_s1, df_s2, df_s3)
-        blocker_keep.layer3_semantic_embeddings(df_s1, df_s2, df_s3)
-        if args.embedder2:
-            blocker_keep.layer3_semantic_embeddings(df_s1, df_s2, df_s3, model_name=args.embedder2)
-        blocker_keep.layer4_address_only(df_s1, df_s2, df_s3)
-        blocker_keep.layer4b_near_exact_address(df_s1, df_s2, df_s3)
-        blocker_keep.layer5_phone_key_blocking(df_s1, df_s2, df_s3)
+        done_layers = blocker_keep.load_progress(ckpt_dir, "blocker_progress_test.pkl") if args.resume else set()
+        for name, method in (
+            ('layer1', blocker_keep.layer1_exact_key_blocking),
+            ('layer2', blocker_keep.layer2_tfidf_blocking),
+            ('layer3', blocker_keep.layer3_semantic_embeddings),
+            ('layer4', blocker_keep.layer4_address_only),
+            ('layer4b', blocker_keep.layer4b_near_exact_address),
+            ('layer5', blocker_keep.layer5_phone_key_blocking),
+        ):
+            if name in done_layers and name != 'layer3':
+                print(f"[checkpoint] skipping {name} (already done)")
+                continue
+            frames = store.stage(name)
+            method(*frames)
+            if name == 'layer3' and args.embedder2:
+                blocker_keep.layer3_semantic_embeddings(*frames, model_name=args.embedder2)
+            del frames
+            if name != 'layer3':
+                done_layers.add(name)
+            blocker_keep.save_progress(ckpt_dir, done_layers, "blocker_progress_test.pkl")
         df_pairs = blocker_keep.export_candidate_pairs(os.path.join(args.output_dir, "candidate_pairs.tsv"))
         save_ckpt(ckpt_dir, "pairs_test.pkl", df_pairs)
 
@@ -118,8 +120,8 @@ def main():
     print("\n========== STAGE 2: FEATURE ENGINEERING ==========")
     df_features = load_ckpt(ckpt_dir, "features_test.pkl") if args.resume else None
     if df_features is None:
-        df_features = build_features_for_pairs(df_pairs, df_s1, df_pool, blocker=blocker_keep,
-                                               use_cross_encoder=not args.no_cross_encoder)
+        df_features = build_features_for_pairs(df_pairs, None, None, blocker=blocker_keep,
+                                               use_cross_encoder=not args.no_cross_encoder, store=store)
         save_ckpt(ckpt_dir, "features_test.pkl", df_features)
 
     # =================== ENSEMBLE PREDICTION ===================
@@ -132,7 +134,7 @@ def main():
     all_proba /= len(models)
     df_features['xgb_prob'] = all_proba
 
-    rc = row_countries(df_features, df_s1)
+    rc = df_features['source1_entity_id'].map(store.country_map()).fillna('').values
     df_features['final_pred'] = apply_thresholds(rc, all_proba, thresholds)
 
     # =================== LLM SNIPER ===================
@@ -148,6 +150,7 @@ def main():
         if 0 < n_borderline < 5000:
             try:
                 df_border = df_features[borderline_mask].copy()
+                df_s1, df_pool = store.pair_frames(df_border)
                 df_border = df_border.merge(df_s1[['entity_id', 'clean_name', 'clean_address']],
                                             left_on='source1_entity_id', right_on='entity_id', how='left')
                 df_border.rename(columns={'clean_name': 'name_s1', 'clean_address': 'addr_s1'}, inplace=True)

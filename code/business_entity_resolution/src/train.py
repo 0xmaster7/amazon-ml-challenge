@@ -6,7 +6,8 @@ import pickle
 import gc
 import xgboost as xgb
 from sklearn.model_selection import StratifiedGroupKFold
-from data_cleaner import process_dataframe, slim_frame, mem_rss
+from data_cleaner import mem_rss
+from streaming_clean import CleanStore
 from blocker import LayeredBlocker
 from feature_engineering import build_features_for_pairs
 from scorer import build_true_dict, macro_score_from_proba
@@ -174,23 +175,13 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     ckpt_dir = os.path.join(args.output_dir, "checkpoints")
     os.makedirs(ckpt_dir, exist_ok=True)
-    nrows = 1000 if args.test_mode else None
 
     # =================== LOAD & CLEAN ===================
     print("========== LOADING DATA ==========")
-    cleaned = load_ckpt(ckpt_dir, "cleaned_train.pkl") if args.resume else None
-    if cleaned is not None:
-        df_s1, df_s2, df_s3 = cleaned
-    else:
-        df_s1 = process_dataframe(pd.read_csv(os.path.join(args.data_dir, "train_source1.tsv"), sep="\t", nrows=nrows))
-        df_s2 = process_dataframe(pd.read_csv(os.path.join(args.data_dir, "train_source2.tsv"), sep="\t", nrows=nrows))
-        df_s3 = process_dataframe(pd.read_csv(os.path.join(args.data_dir, "train_source3.tsv"), sep="\t", nrows=nrows))
-        save_ckpt(ckpt_dir, "cleaned_train.pkl", (df_s1, df_s2, df_s3))
-    # Slim even checkpoint-loaded frames (older checkpoints carry the fat columns)
-    df_s1, df_s2, df_s3 = slim_frame(df_s1), slim_frame(df_s2), slim_frame(df_s3)
-    print(f"[mem {mem_rss():.1f}GB] cleaned data loaded/slimmed")
-    # df_pool is built AFTER blocking with only the columns the feature
-    # stage needs - embed_text/name_first_token stay out of it.
+    store = CleanStore(ckpt_dir, args.data_dir, 'train', args.resume,
+                       chunk_size=1000 if args.test_mode else 50000,
+                       max_rows=1000 if args.test_mode else None)
+    print(f"[mem {mem_rss():.1f}GB] disk-backed cleaned data ready")
 
     gt = pd.read_csv(os.path.join(args.data_dir, "train_ground_truth.tsv"), sep="\t")
 
@@ -231,35 +222,30 @@ def main():
         # Per-layer checkpointing: each completed layer survives an OOM/kill.
         done_layers = blocker_keep.load_progress(ckpt_dir) if args.resume else set()
 
-        def run_layer(name, fn):
-            if name in done_layers:
+        for name, method in (
+            ('layer1', blocker_keep.layer1_exact_key_blocking),
+            ('layer2', blocker_keep.layer2_tfidf_blocking),
+            ('layer3', blocker_keep.layer3_semantic_embeddings),
+            ('layer4', blocker_keep.layer4_address_only),
+            ('layer4b', blocker_keep.layer4b_near_exact_address),
+            ('layer5', blocker_keep.layer5_phone_key_blocking),
+        ):
+            if name in done_layers and name != 'layer3':
                 print(f"[checkpoint] skipping {name} (already done)")
-                return
-            fn()
-            done_layers.add(name)
+                continue
+            frames = store.stage(name)
+            method(*frames)
+            if name == 'layer3' and args.embedder2:
+                blocker_keep.layer3_semantic_embeddings(*frames, model_name=args.embedder2)
+            del frames
+            gc.collect()
+            if name != 'layer3':
+                done_layers.add(name)
             blocker_keep.save_progress(ckpt_dir, done_layers)
-
-        run_layer('layer1', lambda: blocker_keep.layer1_exact_key_blocking(df_s1, df_s2, df_s3))
-        run_layer('layer2', lambda: blocker_keep.layer2_tfidf_blocking(df_s1, df_s2, df_s3))
-        # Layer 3 ALWAYS runs: its memmap cache skips re-encoding, and the
-        # feature stage needs the embeddings + id maps attached. Pairs it adds
-        # are idempotent, and we save progress right after so a later-layer
-        # kill doesn't lose them.
-        blocker_keep.layer3_semantic_embeddings(df_s1, df_s2, df_s3)
-        if args.embedder2:
-            blocker_keep.layer3_semantic_embeddings(df_s1, df_s2, df_s3, model_name=args.embedder2)
-        blocker_keep.save_progress(ckpt_dir, done_layers)
-        run_layer('layer4', lambda: blocker_keep.layer4_address_only(df_s1, df_s2, df_s3))
-        run_layer('layer4b', lambda: blocker_keep.layer4b_near_exact_address(df_s1, df_s2, df_s3))
-        run_layer('layer5', lambda: blocker_keep.layer5_phone_key_blocking(df_s1, df_s2, df_s3))
         df_pairs = blocker_keep.export_candidate_pairs(os.path.join(args.output_dir, "candidate_pairs.tsv"))
         save_ckpt(ckpt_dir, "pairs_train.pkl", df_pairs)
 
-    # Trimmed pool for the feature stage, then the raw source frames go away.
-    df_pool = pd.concat([df_s2[['entity_id', 'business_name', 'clean_name', 'expanded_name', 'clean_address', 'raw_address', 'country', 'country_norm', 'extracted_pin', 'house_number', 'street_tokens', 'city_tag', 'state_tag', 'phone_keys']], df_s3[['entity_id', 'business_name', 'clean_name', 'expanded_name', 'clean_address', 'raw_address', 'country', 'country_norm', 'extracted_pin', 'house_number', 'street_tokens', 'city_tag', 'state_tag', 'phone_keys']]]).reset_index(drop=True)
-    del df_s2, df_s3
-    gc.collect()
-    print(f"[mem {mem_rss():.1f}GB] blocking done, pool trimmed, s2/s3 freed")
+    print(f"[mem {mem_rss():.1f}GB] blocking done; no full feature pool in RAM")
 
     # =================== GROUND TRUTH LABELING ===================
     print("\n========== LABELING CANDIDATES ==========")
@@ -303,8 +289,8 @@ def main():
     print(f"\n========== STAGE 2: FEATURE ENGINEERING ========== [mem {mem_rss():.1f}GB]")
     df_features = load_ckpt(ckpt_dir, "features_train.pkl") if args.resume else None
     if df_features is None:
-        df_features = build_features_for_pairs(df_pairs, df_s1, df_pool, blocker=blocker_keep,
-                                               use_cross_encoder=not args.no_cross_encoder)
+        df_features = build_features_for_pairs(df_pairs, None, None, blocker=blocker_keep,
+                                               use_cross_encoder=not args.no_cross_encoder, store=store)
         save_ckpt(ckpt_dir, "features_train.pkl", df_features)
     # Free blocking-stage frames and the embedder memmaps before training:
     # they are unneeded now and cost GBs on a 13GB box.
@@ -313,8 +299,7 @@ def main():
     gc.collect()
 
     # =================== TRAIN XGBOOST ===================
-    strata = df_features['source1_entity_id'].map(
-        df_s1.set_index('entity_id')['country_norm']).astype(object).fillna('').values
+    strata = df_features['source1_entity_id'].map(store.country_map()).fillna('').values
     models, thresholds, feature_cols, oof_proba = train_xgboost(
         df_features, df_features['is_true_match'], df_features['source1_entity_id'],
         strata, args.output_dir, gt, seeds, args.stratify, args.no_spw
@@ -334,6 +319,7 @@ def main():
             try:
                 df_border = df_features[borderline_mask].copy()
                 df_border['xgb_prob'] = oof_proba[borderline_mask]
+                df_s1, df_pool = store.pair_frames(df_border)
                 df_border = df_border.merge(df_s1[['entity_id', 'clean_name', 'clean_address']],
                                             left_on='source1_entity_id', right_on='entity_id', how='left')
                 df_border.rename(columns={'clean_name': 'name_s1', 'clean_address': 'addr_s1'}, inplace=True)

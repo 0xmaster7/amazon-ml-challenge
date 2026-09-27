@@ -263,14 +263,14 @@ def _build_features_chunk(df_pairs, df_s1, df_pool, blocker=None, use_cross_enco
 
 
 def build_features_for_pairs(df_pairs, df_s1, df_pool, blocker=None,
-                             use_cross_encoder=True, chunk_size=200000):
+                             use_cross_encoder=True, chunk_size=20000, store=None):
     """Memory-bounded wrapper: features are built in chunks of pairs so the
     string-heavy merged frame never covers the whole candidate set at once
     (this was the next OOM after Layer 2 on a 13GB box). The cross-encoder
     model loads ONCE and is reused across chunks."""
     import gc
     n = len(df_pairs)
-    if n <= chunk_size:
+    if n <= chunk_size and store is None:
         return _build_features_chunk(df_pairs, df_s1, df_pool, blocker=blocker,
                                      use_cross_encoder=use_cross_encoder)
     n_chunks = (n + chunk_size - 1) // chunk_size
@@ -282,12 +282,14 @@ def build_features_for_pairs(df_pairs, df_s1, df_pool, blocker=None,
     parts = []
     for ci, start in enumerate(range(0, n, chunk_size)):
         print(f"  Feature chunk {ci + 1}/{n_chunks}... [mem {mem_rss():.1f}GB]")
+        pair_chunk = df_pairs.iloc[start:start + chunk_size].copy()
+        part_s1, part_pool = store.pair_frames(pair_chunk) if store is not None else (df_s1, df_pool)
         part = _build_features_chunk(
-            df_pairs.iloc[start:start + chunk_size].copy(), df_s1, df_pool,
+            pair_chunk, part_s1, part_pool,
             blocker=blocker, use_cross_encoder=use_cross_encoder,
             cross_model=cross_model)
         parts.append(part)
-        del part
+        del part, pair_chunk, part_s1, part_pool
         gc.collect()
     out = pd.concat(parts, ignore_index=True)
     del parts

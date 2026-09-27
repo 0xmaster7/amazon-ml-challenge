@@ -1,4 +1,3 @@
-import pandas as pd
 from transformers import pipeline
 
 class LLMSniper:
